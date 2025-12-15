@@ -11,7 +11,7 @@ Automated Reconnaissance Framework
 Created by Othman Kamal
 ```
 
-**Reconic** is a powerful, production-ready reconnaissance orchestrator designed for bug bounty hunters and security professionals. It intelligently combines the **best-in-class ProjectDiscovery tools** into a seamless, guided workflow without reinventing the wheel.
+**Reconic** is a powerful reconnaissance orchestrator designed for bug bounty hunters and security professionals. It intelligently combines the **best-in-class ProjectDiscovery tools** into a seamless, guided workflow without reinventing the wheel.
 
 ---
 
