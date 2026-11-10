@@ -38,6 +38,7 @@ STAGES = ('enumerate', 'probe', 'crawl', 'takeover', 'nuclei')
 @dataclass
 class ScanConfig:
     scope: Scope
+    name: Optional[str] = None  # history key; defaults to the first scope pattern
     output_dir: Path = Path('reconic_output')
     options: RunOptions = field(default_factory=RunOptions)
     passive: bool = False
@@ -82,7 +83,8 @@ class Pipeline:
                  on_end: Optional[Callable[[StageReport], None]] = None,
                  picker: Optional[Callable[[List[dict]], List[dict]]] = None):
         self.config = config
-        label = re.sub(r'[^a-z0-9.-]+', '_', config.scope.include[0].lstrip('*.')) or 'scan'
+        label = re.sub(r'[^a-z0-9.-]+', '_', (config.name or config.scope.include[0]).lower().lstrip('*.'))
+        label = self.target = label.strip('.') or 'scan'
         stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         self.run_dir = Path(config.output_dir) / label / stamp
         suffix = 2
@@ -184,7 +186,7 @@ class Pipeline:
         args = ['-list', self._input_file('crawl', urls), '-d', str(cfg.depth), '-jc',
                 '-ct', f"{cfg.crawl_minutes}m"]
         if cfg.depth >= 3:
-            args += ['-kf', 'robotstxt,sitemapxml']
+            args += ['-kf', 'all']  # robots.txt and sitemap.xml; katana wants depth 3+ for these
         if cfg.headless:
             args.append('-hl')
         regexes = cfg.scope.url_regexes()
@@ -282,6 +284,7 @@ class Pipeline:
 
         results = {
             'reconic_version': __version__,
+            'target': self.target,
             'started': started.isoformat(timespec='seconds'),
             'finished': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'scope': cfg.scope.to_dict(),

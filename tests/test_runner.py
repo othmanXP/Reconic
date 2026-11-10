@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from reconic.pipeline import HTTPX, NUCLEI, SUBFINDER
+from reconic.pipeline import HTTPX, KATANA, NUCLEI, SUBFINDER
 from reconic.runner import Runner, RunOptions, ToolError, ToolSpec
 
 
@@ -57,6 +57,12 @@ def test_nonzero_exit_is_reported_with_stderr(fake_tools, tmp_path, monkeypatch)
     assert not result.ok
     assert result.returncode == 3
     assert 'boom: simulated failure' in result.failure()
+
+
+def test_error_printed_on_stdout_is_still_reported(fake_tools, tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_FAIL_STDOUT', 'katana')
+    result = run(make_runner(fake_tools, tmp_path).run(KATANA, ['-list', 'x'], 'crawl', 30))
+    assert 'invalid value for flag -x' in result.failure()
 
 
 def test_timeout_kills_the_tool_and_keeps_partial_output(fake_tools, tmp_path, monkeypatch):

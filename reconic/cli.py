@@ -1,10 +1,12 @@
-"""Command line interface: `reconic scan` and `reconic doctor`."""
+"""Command line interface: `reconic scan`, `diff`, `runs` and `doctor`."""
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -15,14 +17,19 @@ from .banner import print_banner
 from .pipeline import TOOLS, Pipeline, ScanConfig, StageReport, failed_stages
 from .runner import Runner, RunOptions
 from .scope import Scope, host_of
+from .store import DB_NAME, KINDS, Store, StoreError
 
 TOR_PROXY = 'socks5://127.0.0.1:9050'
 _COLORS = {'red': 31, 'green': 32, 'yellow': 33, 'cyan': 36, 'dim': 2, 'bold': 1}
 _SEVERITY_COLORS = {'critical': 'red', 'high': 'red', 'medium': 'yellow'}
 
 
-def _paint(text: str, color: str) -> str:
-    if not sys.stderr.isatty() or 'NO_COLOR' in os.environ:
+_KIND_LABELS = {'host': 'hosts', 'alive': 'alive', 'endpoint': 'endpoints', 'takeover': 'takeovers',
+                'vuln': 'vulns'}
+
+
+def _paint(text: str, color: str, stream=None) -> str:
+    if not (stream or sys.stderr).isatty() or 'NO_COLOR' in os.environ:
         return text
     return f"\033[{_COLORS[color]}m{text}\033[0m"
 
@@ -36,9 +43,22 @@ def build_parser() -> argparse.ArgumentParser:
         prog='reconic', description='Scope-safe recon orchestrator for subfinder, httpx, katana and nuclei.')
     parser.add_argument('--version', action='version', version=f"reconic {__version__}")
     parser.add_argument('--no-banner', action='store_true', help='do not print the banner')
-    sub = parser.add_subparsers(dest='command', metavar='{scan,doctor}')
+    sub = parser.add_subparsers(dest='command', metavar='{scan,diff,runs,doctor}')
 
     sub.add_parser('doctor', help='show which tools were found and their versions')
+
+    history = argparse.ArgumentParser(add_help=False)
+    history.add_argument('target', nargs='?', help='target name as shown by `reconic runs`')
+    history.add_argument('-o', '--output-dir', type=Path, default=Path('reconic_output'), metavar='DIR',
+                         help='directory holding the history (default ./reconic_output)')
+    history.add_argument('--json', action='store_true', help='print JSON instead of text')
+
+    sub.add_parser('runs', parents=[history], help='list recorded runs')
+    diff = sub.add_parser(
+        'diff', parents=[history], help='show what changed between two runs',
+        description='Compares the latest run of a target with the one before it, unless --old/--new say otherwise.')
+    diff.add_argument('--old', type=int, metavar='RUN', help='run id to compare from')
+    diff.add_argument('--new', type=int, metavar='RUN', help='run id to compare to')
 
     scan = sub.add_parser(
         'scan', help='run the recon pipeline',
@@ -85,7 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     out = scan.add_argument_group('output')
     out.add_argument('-o', '--output-dir', type=Path, default=Path('reconic_output'), metavar='DIR',
-                     help='where run directories are created (default ./reconic_output)')
+                     help='where run directories and the history are kept (default ./reconic_output)')
+    out.add_argument('--name', metavar='NAME',
+                     help='name this target is tracked under in the history (default: first scope pattern)')
     out.add_argument('-y', '--yes', action='store_true',
                      help='confirm you are authorized to test this scope, without the prompt')
     return parser
@@ -230,12 +252,147 @@ def _summary(results: dict, run_dir: Path) -> None:
     _say()
 
 
+def _when(stamp: str) -> str:
+    return stamp[:16].replace('T', ' ') + ' UTC'
+
+
+def _added_text(kind: str, item: dict) -> str:
+    text = item['key']
+    if kind in ('takeover', 'vuln'):
+        text = f"[{item.get('severity') or 'unknown'}] {text}"
+    elif kind == 'alive' and item.get('status'):
+        text = f"{text}  [{item['status']}]"
+    return text + ("  (seen before)" if item['seen_before'] else "")
+
+
+def _record(results: dict, run_dir: Path, output_dir: Path) -> None:
+    """Save the run to the history and report what is new since the previous one."""
+    try:
+        with Store(output_dir / DB_NAME) as store:
+            run_id = store.record(results, run_dir)
+            previous = store.previous_run(results['target'], run_id)
+            diff = store.diff(previous, run_id) if previous else None
+    except (sqlite3.Error, StoreError) as error:
+        _say(_paint(f"  History not updated: {error}", 'red'))
+        return
+    if diff is None:
+        _say(f"  Run {run_id}: first recorded run for {results['target']}")
+        return
+    _say(f"  Run {run_id}: new since run {previous} ({_when(diff['old']['started'])})")
+    if diff['scope_changed']:
+        _say(_paint("    the scope changed between these runs", 'yellow'))
+    quiet = True
+    for kind in KINDS:
+        entry = diff['kinds'][kind]
+        if not entry['comparable']:
+            quiet = False
+            _say(_paint(f"    {_KIND_LABELS[kind]} not compared: {entry['reason']}", 'dim'))
+        elif kind == 'endpoint' and entry['added']:
+            quiet = False
+            _say(f"    {_paint('+', 'green')} {len(entry['added'])} endpoint(s)")
+        else:
+            for item in entry['added']:
+                quiet = False
+                _say(f"    {_paint('+', 'green')} {kind:<9} {_added_text(kind, item)}")
+    if quiet:
+        _say(_paint("    nothing new", 'dim'))
+    _say(_paint(f"    full list: reconic diff {results['target']}", 'dim'))
+
+
+def _open_history(args: argparse.Namespace) -> Optional[Store]:
+    path = args.output_dir / DB_NAME
+    if not path.is_file():
+        _say(_paint(f"  error: no history at {path}; run a scan first or point -o at its output directory", 'red'))
+        return None
+    return Store(path)
+
+
+def _runs(args: argparse.Namespace) -> int:
+    store = _open_history(args)
+    if store is None:
+        return 2
+    with store:
+        runs = store.runs(args.target)
+    if args.json:
+        print(json.dumps(runs, indent=2))
+        return 0
+    if not runs:
+        _say(f"  No runs recorded for {args.target}." if args.target else "  No runs recorded.")
+        return 0
+    print(f"{'run':>4}  {'started':<20}  {'target':<24} {'hosts':>6} {'alive':>6} {'endpoints':>9} "
+          f"{'takeovers':>9} {'vulns':>6}  incomplete")
+    for run in runs:
+        counts = run['counts']
+        incomplete = ', '.join(name for name, stage in run['stages'].items()
+                               if stage['status'] in ('failed', 'timeout'))
+        print(f"{run['id']:>4}  {_when(run['started']):<20}  {run['target']:<24} {counts['host']:>6} "
+              f"{counts['alive']:>6} {counts['endpoint']:>9} {counts['takeover']:>9} {counts['vuln']:>6}  "
+              f"{incomplete}")
+    return 0
+
+
+def _diff(args: argparse.Namespace) -> int:
+    store = _open_history(args)
+    if store is None:
+        return 2
+    with store:
+        try:
+            target = args.target
+            if args.new is not None:
+                run = store.run(args.new)
+                if run is None:
+                    raise StoreError(f"no such run: {args.new}")
+                target = target or run['target']
+            if target is None:
+                targets = store.targets()
+                if len(targets) != 1:
+                    raise StoreError("name the target to diff: " + ', '.join(targets))
+                target = targets[0]
+            runs = store.runs(target)
+            if not runs:
+                raise StoreError(f"no runs recorded for {target}")
+            new_id = args.new if args.new is not None else runs[-1]['id']
+            old_id = args.old if args.old is not None else store.previous_run(target, new_id)
+            if old_id is None:
+                raise StoreError(f"run {new_id} is the first run of {target}; nothing to compare with")
+            diff = store.diff(old_id, new_id)
+        except StoreError as error:
+            _say(_paint(f"  error: {error}", 'red'))
+            return 2
+
+    if args.json:
+        print(json.dumps(diff, indent=2))
+        return 0
+    out = sys.stdout
+    print(f"{diff['target']}  run {diff['old']['id']} ({_when(diff['old']['started'])}) -> "
+          f"run {diff['new']['id']} ({_when(diff['new']['started'])})")
+    if diff['scope_changed']:
+        print(_paint("note: the scope changed between these runs", 'yellow', out))
+    print()
+    for kind in KINDS:
+        entry = diff['kinds'][kind]
+        label = f"{_KIND_LABELS[kind]:<10}"
+        if not entry['comparable']:
+            print(f"{label} {_paint('not compared: ' + entry['reason'], 'dim', out)}")
+        elif not entry['added'] and not entry['removed']:
+            print(f"{label} {_paint('no change', 'dim', out)}")
+        else:
+            print(f"{label} +{len(entry['added'])} -{len(entry['removed'])}")
+            for item in entry['added']:
+                print(f"  {_paint('+', 'green', out)} {_added_text(kind, item)}")
+            for key in entry['removed']:
+                print(f"  {_paint('-', 'red', out)} {key}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help(sys.stderr)
         return 2
+    if args.command in ('runs', 'diff'):
+        return _runs(args) if args.command == 'runs' else _diff(args)
     if not args.no_banner:
         print_banner()
 
@@ -251,7 +408,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
         config = ScanConfig(
-            scope=scope, output_dir=args.output_dir, options=options,
+            scope=scope, name=args.name, output_dir=args.output_dir, options=options,
             passive=args.passive, crawl=not args.no_crawl, takeover=not args.no_takeover,
             nuclei=not args.no_nuclei, all_sources=args.all_sources, threads=args.threads,
             depth=args.depth, headless=args.headless, crawl_minutes=args.crawl_minutes,
@@ -265,6 +422,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                             picker=_pick if args.pick and sys.stdin.isatty() else None)
         results = asyncio.run(pipeline.run())
         _summary(results, pipeline.run_dir)
+        _record(results, pipeline.run_dir, args.output_dir)
+        _say()
         print(pipeline.run_dir / 'results.json')
         return 1 if failed_stages(results) else 0
     except KeyboardInterrupt:

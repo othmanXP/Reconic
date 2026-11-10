@@ -3,8 +3,10 @@
 Behaviour follows the name it is invoked as. Environment switches:
   FAKE_LOG       file that receives one JSON line per invocation (name + args)
   FAKE_FAIL      comma-separated tool names that exit 3 with a message on stderr
+  FAKE_FAIL_STDOUT  like FAKE_FAIL, but exits 2 with the message on stdout
   FAKE_HANG      comma-separated tool names that print one line, then sleep
   FAKE_IMPOSTOR  comma-separated binary names that are "some other program"
+  FAKE_LABELS    comma-separated subdomain labels subfinder reports (default www,api,admin)
 """
 import json
 import os
@@ -42,6 +44,10 @@ if os.environ.get('FAKE_LOG'):
     with open(os.environ['FAKE_LOG'], 'a', encoding='utf-8') as log:
         log.write(json.dumps({'tool': name, 'args': args}) + '\n')
 
+if switched('FAKE_FAIL_STDOUT'):
+    print("invalid value for flag -x")
+    sys.exit(2)
+
 if switched('FAKE_FAIL'):
     print("boom: simulated failure", file=sys.stderr)
     sys.exit(3)
@@ -52,7 +58,7 @@ if switched('FAKE_HANG'):
 
 if name == 'subfinder':
     for domain in read('-dL'):
-        for label in ('www', 'api', 'admin'):
+        for label in os.environ.get('FAKE_LABELS', 'www,api,admin').split(','):
             print(f"{label}.{domain}")
     print("cdn.other-company.net")
 elif name in ('httpx', 'httpx-toolkit'):

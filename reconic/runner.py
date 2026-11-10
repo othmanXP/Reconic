@@ -75,7 +75,8 @@ class ToolResult:
         return ' | '.join(lines[-count:])
 
     def failure(self) -> str:
-        tail = self.stderr_tail()
+        # Some tools print their errors on stdout (katana does for bad flags).
+        tail = self.stderr_tail() or ' | '.join(self.lines()[-3:])
         return f"{self.tool} exited with code {self.returncode}" + (f": {tail}" if tail else "")
 
 
