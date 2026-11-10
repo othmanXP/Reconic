@@ -1,360 +1,277 @@
-# Reconic - Automated Reconnaissance Framework
+<p align="center">
+  <img src="assets/banner.svg" alt="Reconic: scope-safe recon orchestrator" width="760">
+</p>
 
-```
-    ____                        _      
-   / __ \___  _________  ____  (_)____
-  / /_/ / _ \/ ___/ __ \/ __ \/ / ___/
- / _, _/  __/ /__/ /_/ / / / / / /__  
-/_/ |_|\___/\___/\____/_/ /_/_/\___/  
-                                       
-Automated Reconnaissance Framework
-Created by Othman Kamal
-```
+<p align="center">
+  <b>Recon that stays in scope, never hides a failure, and tells you what changed.</b>
+</p>
 
-**Reconic** is a powerful reconnaissance orchestrator designed for bug bounty hunters and security professionals. It intelligently combines the **best-in-class ProjectDiscovery tools** into a seamless, guided workflow without reinventing the wheel.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.9%2B-22d3ee?style=flat-square&labelColor=0b0f19" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/dependencies-none-a78bfa?style=flat-square&labelColor=0b0f19" alt="No Python dependencies">
+  <img src="https://img.shields.io/badge/status-alpha-f472b6?style=flat-square&labelColor=0b0f19" alt="Status: alpha">
+</p>
 
----
-
-## Key Features
-
-### Subdomain Enumeration
-- **Primary**: **Subfinder** (fast, all sources)
-- **Optional**: **Amass** (deep, thorough — slower)
-
-### Alive Host Verification
-- **httpx** with tech detection, titles, status codes, and redirect following
-
-### Endpoint Discovery
-- **Katana** — best-in-class JS-aware crawling with headless support, form filling, and known file discovery
-- **Playwright** fallback for extremely heavy JavaScript applications
-
-### Vulnerability Scanning
-- **Nuclei** with automatic template updates and 10,000+ community templates
-
-### Subdomain Takeover Detection
-- Built-in fingerprinting for 17+ popular services:
-  - GitHub Pages, Heroku, AWS S3, Azure
-  - Cloudfront, Fastly, Pantheon, ReadMe
-  - Bitbucket, Ghost, HelpJuice, HelpScout
-  - Cargo, StatusPage, Tumblr, WordPress, Unbounce
-
-### Stealth & Authentication
-- Full proxy support (HTTP/SOCKS)
-- TOR routing (`--tor`)
-- Cookie & Authorization header authentication
-
-### Two Powerful Modes
-- **Automated Mode** — One-command full reconnaissance
-- **Interactive Mode** (`--interactive`) — Step-by-step control for targeted testing
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#scope">Scope</a> ·
+  <a href="#history-and-diff">History and diff</a> ·
+  <a href="#options">Options</a>
+</p>
 
 ---
 
-## NOTE
+Reconic runs [subfinder](https://github.com/projectdiscovery/subfinder), [httpx](https://github.com/projectdiscovery/httpx), [katana](https://github.com/projectdiscovery/katana) and [nuclei](https://github.com/projectdiscovery/nuclei) as one pipeline. It does not reimplement them. What it adds is the part that is easy to get wrong when you chain them by hand:
 
-> **This tool orchestrates proven tools — it does not replace manual testing.**  
-> Real bounties come from **Burp Suite**, creative thinking, and manual verification.  
-> Reconic gives you the best starting point possible.
+| | |
+|---|---|
+| **Scope is enforced everywhere** | Hosts are checked against your scope before and after every tool. Give it one host and it tests one host; it never widens to the parent domain. |
+| **Failures are loud** | A missing tool, a non-zero exit or a timeout marks the stage as failed, shows the tool's own error, and makes the run exit non-zero. Partial results are kept and labelled as partial. |
+| **Every run is remembered** | Results go into a local SQLite history. Each scan ends with what is new since the last one, and `reconic diff` shows everything added and removed. |
 
----
+## How it works
 
-## 📦 Installation
-
-### 1. Python Dependencies
-
-```bash
-pip install aiohttp aiofiles tldextract beautifulsoup4 dnspython colorama PyYAML requests playwright
-playwright install chromium
+```mermaid
+flowchart LR
+    S([scope]) --> E[enumerate<br/>subfinder]
+    E --> P[probe<br/>httpx]
+    P --> C[crawl<br/>katana]
+    P --> N[scan<br/>nuclei]
+    E --> T[takeover<br/>nuclei]
+    C --> R[(history<br/>+ diff)]
+    N --> R
+    T --> R
 ```
 
-### 2. External Tools (Highly Recommended)
+| Stage | Tool | What it does |
+|---|---|---|
+| `enumerate` | subfinder | Finds subdomains of every wildcard domain in scope. Passive: nothing is sent to the target. |
+| `probe` | httpx | Finds which hosts answer over HTTP, with status, title and technologies. |
+| `crawl` | katana | Collects endpoints from pages, JavaScript, `robots.txt` and `sitemap.xml`. |
+| `takeover` | nuclei | Runs the takeover templates against every in-scope host. |
+| `nuclei` | nuclei | Runs critical, high and medium templates against the alive hosts. |
+
+## Install
+
+Reconic needs Python 3.9 or newer and has no Python dependencies.
 
 ```bash
-# Requires Go 1.21+
-go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install -v github.com/projectdiscovery/katana/cmd/katana@latest
-go install -v github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
-go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-
-# Optional: Deep enumeration (slower but thorough)
-go install -v github.com/owasp-amass/amass/v4/...@master
-
-# Add to PATH
-export PATH=$PATH:$HOME/go/bin
+git clone https://github.com/othmanXP/Reconic.git
+cd Reconic
+pipx install .          # or: pip install .
 ```
 
-### 3. Verify Installation
+Then install the tools it drives (Go 1.21+):
 
 ```bash
-python reconic.py
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
 
-The tool will automatically detect which external tools are installed and show their status.
+Check what Reconic found:
 
----
+```console
+$ reconic doctor
+  Tools
+  ✓ subfinder  v2.14.0    /usr/bin/subfinder
+  ✓ httpx      v1.9.0     /home/you/go/bin/httpx
+  ✓ katana     v1.6.1     /home/you/go/bin/katana
+  ✓ nuclei     v3.9.0     /usr/bin/nuclei
+```
 
-## Usage
+Tools are identified by their version banner, not their file name, so the unrelated Python `httpx` command is skipped. `~/go/bin` is searched even when it is not on your `PATH`.
 
-### Automated Mode (Recommended for full recon)
+## Quick start
 
 ```bash
-python reconic.py https://example.com
+# A whole domain: enumerate subdomains, then probe, crawl and scan them
+reconic scan -d example.com
+
+# One host only, with no enumeration
+reconic scan -u app.example.com
+
+# Enumeration only; nothing is sent to the target
+reconic scan -d example.com --passive
+
+# A bug bounty program: scope file, gentle rate, your identifying header
+reconic scan --scope scope.txt --rate-limit 20 -H "X-Bug-Bounty: yourname"
 ```
 
-### Interactive Mode (Perfect for targeted testing)
+Active scans ask you to confirm that you are authorized to test the scope. Pass `-y` to confirm up front, for example in a scheduled job.
 
-```bash
-python reconic.py --interactive
+Example output:
+
+```console
+$ reconic scan -d example.com -x admin.example.com
+  Scope
+    + example.com
+    + *.example.com
+    - admin.example.com
+
+  ▸ enumerate  subfinder on 1 domain(s)
+  ✓ enumerate  3 host(s) · 2 out of scope dropped · 4.2s
+  ▸ probe      httpx on 3 host(s)
+  ✓ probe      3 alive · 1.9s
+  ▸ crawl      katana on 3 URL(s), depth 3
+  ✓ crawl      6 endpoint(s) · 1 out of scope dropped · 31.0s
+  ▸ takeover   nuclei on 3 target(s)
+  ✓ takeover   1 finding(s) · 48.5s
+  ▸ nuclei     nuclei on 3 target(s)
+  ✓ nuclei     1 finding(s) · 1 out of scope dropped · 602.3s
+
+  3 host(s) · 3 alive · 6 endpoint(s) · 2 finding(s)
+    high     github-takeover  example.com
+    medium   exposed-git-config  https://example.com/.git/config
+
+  Results  reconic_output/example.com/20261110-235317
+
+  Run 2: new since run 1 (2026-11-10 21:53 UTC)
+    + host      staging.example.com
+    + alive     https://staging.example.com  [200]
+    + 2 endpoint(s)
+    full list: reconic diff example.com
 ```
 
-This launches a guided wizard that lets you:
-- Choose enumeration methods (Subfinder, Amass, or both)
-- Select specific subdomains to test
-- Pick which tests to run (alive check, crawling, takeover, Nuclei)
-- Configure proxy/authentication
-- Review configuration before execution
+## Scope
 
----
+Scope decides what Reconic may touch and what it may report. Exclusions always win.
 
-## Command Line Options
+| Pattern | Matches |
+|---|---|
+| `app.example.com` | exactly that host |
+| `*.example.com` | every subdomain of `example.com` at any depth, but not `example.com` itself |
+| `api-*.example.com` | `api-v2.example.com`, `api-eu.example.com`, and so on |
+| `10.0.0.0/24` | every address in the network |
 
-### Basic Options
-```bash
---timeout N            Request timeout (default: 20)
---concurrency N        Concurrent requests (default: 100)
---depth N              Crawl depth (default: 3)
---output-dir DIR       Output directory (default: ./reconic_output)
+There are three ways to set it, and they can be combined:
+
+| Flag | Effect |
+|---|---|
+| `-d example.com` | puts `example.com` and `*.example.com` in scope and enumerates subdomains |
+| `-u app.example.com` | puts that one host in scope; a URL works too |
+| `--scope FILE` | reads patterns from a file |
+| `-x PATTERN` | keeps a pattern out of scope |
+
+A scope file has one pattern per line. `!` excludes and `#` starts a comment:
+
+```text
+# Example program
+*.example.com
+example.com
+!admin.example.com
+!*.corp.example.com
 ```
 
-### Tool Control
-```bash
---no-subfinder         Disable Subfinder
---use-amass            Enable Amass (slower, more thorough)
---no-katana            Disable Katana crawler
---use-playwright       Enable Playwright fallback
---no-httpx             Disable httpx probing
---no-nuclei            Disable Nuclei scanning
---no-takeover          Skip takeover detection
+How scope is applied:
+
+- Out-of-scope hosts returned by a tool are dropped before the next stage and counted in the stage line.
+- katana receives the scope as crawl rules, so it does not follow links off-scope.
+- httpx does not follow redirects, because a redirect can lead off-scope. The `Location` header is recorded instead.
+
+## History and diff
+
+Every run is saved to `reconic_output/reconic.db`. Three commands read it:
+
+```console
+$ reconic runs
+ run  started               target        hosts  alive endpoints takeovers  vulns  incomplete
+   1  2026-11-10 21:53 UTC  example.com       3      3         6         1      1
+   2  2026-11-11 21:53 UTC  example.com       3      3         6         1      1
+
+$ reconic diff example.com
+example.com  run 1 (2026-11-10 21:53 UTC) -> run 2 (2026-11-11 21:53 UTC)
+
+hosts      +1 -1
+  + staging.example.com
+  - api.example.com
+alive      +1 -1
+  + https://staging.example.com  [200]
+  - https://api.example.com
+endpoints  +2 -2
+  + https://staging.example.com/api/v1/users?id=1
+  + https://staging.example.com/login
+  - https://api.example.com/api/v1/users?id=1
+  - https://api.example.com/login
+takeovers  no change
+vulns      no change
 ```
 
-### Proxy/Authentication
-```bash
---proxy URL            HTTP/SOCKS proxy
---tor                  Use TOR (127.0.0.1:9050)
---auth-cookie COOKIE   Authentication cookie
---auth-header HEADER   Authorization header
-```
+- `reconic diff` compares the latest run of a target with the one before it. Use `--old` and `--new` to pick runs, and `--json` for scripts.
+- If a stage failed or was skipped in either run, its results show as `not compared` with the reason, rather than as everything having disappeared.
+- An asset that was seen in an older run, went away and came back is marked `(seen before)`.
+- A note is shown when the two runs used different scopes.
+- `scan --name NAME` sets the name a target is tracked under. By default it is the first scope pattern.
 
-### Advanced
-```bash
---nuclei-templates DIR Custom Nuclei templates directory
---interactive, -i      Launch interactive mode
-```
+## Options
 
----
+`reconic scan`:
 
-## Common Examples
+| Option | Meaning |
+|---|---|
+| `--passive` | enumeration only; nothing is sent to the target |
+| `--no-crawl`, `--no-takeover`, `--no-nuclei` | skip a stage |
+| `--pick` | choose which alive hosts to continue with after probing |
+| `--proxy URL`, `--tor` | send every tool through a proxy; `--tor` uses `socks5://127.0.0.1:9050` |
+| `-H "Name: value"`, `--cookie COOKIE` | header sent with every request to the target |
+| `--rate-limit N` | maximum requests per second, per tool |
+| `--threads N` | httpx threads (default 50) |
+| `--all-sources` | subfinder: use every source (slower) |
+| `--depth N` | crawl depth (default 3) |
+| `--headless` | katana: crawl with a headless browser |
+| `--crawl-minutes N` | katana: maximum crawl duration per target (default 10) |
+| `--severity LIST` | nuclei severities (default `critical,high,medium`) |
+| `--templates DIR` | nuclei: custom templates |
+| `--stage-timeout MIN` | hard limit per stage; the tool is stopped after it (default 60) |
+| `-o DIR` | where run directories and the history are kept (default `./reconic_output`) |
+| `-y` | confirm authorization without the prompt |
 
-### Basic automated scan
-```bash
-python reconic.py https://example.com
-```
+Things worth knowing:
 
-### Deep scan with Amass (takes 10-20 minutes)
-```bash
-python reconic.py https://example.com --use-amass
-```
-
-### Authenticated scan with cookies
-```bash
-python reconic.py https://app.example.com --auth-cookie 'session=abc123'
-```
-
-### Stealth mode via TOR
-```bash
-python reconic.py https://example.com --tor
-```
-
-### Custom Nuclei templates
-```bash
-python reconic.py https://example.com --nuclei-templates ./my-templates
-```
-
-### Quick subdomain enum only (no scanning)
-```bash
-python reconic.py https://example.com --no-katana --no-nuclei
-```
-
-### Full interactive workflow
-```bash
-python reconic.py --interactive
-# Then follow the guided prompts
-```
-
----
+- **Proxy.** A proxy applies to every tool. A tool that cannot be proxied refuses to run instead of connecting directly. The tools may still resolve DNS locally.
+- **Headers.** Auth headers go to httpx, katana and nuclei. They are never sent to subfinder's third-party sources, and they are redacted in the saved command lines.
+- **Timeouts.** When a stage hits its limit, the tool and everything it started is stopped, and whatever it had produced is kept.
 
 ## Output
 
-All results are saved to `./reconic_output/`:
+Each run gets its own directory, so results from different runs never mix:
 
-```
+```text
 reconic_output/
-├── recon_20251215_143022.json      # Full structured results
-├── httpx_output.json                # Alive hosts with metadata
-├── katana_output.txt                # Discovered endpoints
-├── nuclei_results.json              # Vulnerability findings
-├── subfinder_example.com.txt        # Subdomain enumeration results
-└── interactive_scan_*.json          # Interactive mode results
+├── reconic.db                      history of every run
+└── example.com/
+    └── 20261110-235317/
+        ├── results.json            everything, including each stage's status
+        ├── subdomains.txt
+        ├── alive.txt
+        ├── endpoints.txt
+        ├── findings.jsonl
+        └── raw/                    each tool's input, command line, stdout and stderr
 ```
 
-### Results Structure
+`reconic scan` prints progress to stderr and the path of `results.json` to stdout. It exits `0` when every stage completed, `1` when a stage failed or timed out, and `2` when it did not start.
 
-The main JSON output contains:
-- `target` - Target URL
-- `scan_date` - Timestamp
-- `tools_used` - Which tools were available/used
-- `subdomains` - All discovered subdomains
-- `alive_hosts` - Live hosts with HTTP metadata
-- `endpoints` - Crawled endpoints
-- `takeovers` - Potential takeover vulnerabilities
-- `nuclei_results` - Path to Nuclei scan results
+## Status
 
----
+Reconic 2 is an alpha rewrite. It has been run end to end against a real site with a single-host scope. Subdomain enumeration on a real domain is covered by the test suite but has not yet had the same real-world use. Expect rough edges and please report them.
 
-## Workflow Phases
+## Development
 
-Reconic executes reconnaissance in five organized phases:
+The test suite runs the whole pipeline against stand-in tool binaries, so it needs no network and scans nothing:
 
-### Phase 1: Subdomain Enumeration
-- Runs Subfinder (fast, passive sources)
-- Optionally runs Amass (deep, active enumeration)
-- Deduplicates and sorts results
-
-### Phase 2: Alive Host Verification
-- Uses httpx to probe all discovered subdomains
-- Captures status codes, titles, technologies
-- Follows redirects and filters CDN responses
-
-### Phase 3: Subdomain Takeover Detection
-- DNS CNAME resolution
-- Service fingerprinting
-- HTTP response analysis
-- **Critical findings flagged immediately**
-
-### Phase 4: Endpoint Discovery
-- Katana crawls alive hosts with JS rendering
-- Extracts all links, forms, API endpoints
-- Optionally uses Playwright for heavy JS sites
-
-### Phase 5: Nuclei Vulnerability Scanning
-- Updates templates automatically
-- Scans hosts + discovered endpoints
-- Filters by severity (critical/high/medium)
-- Organized output by vulnerability type
-
----
-
-## Next Steps After Reconic
-
-1. **Review takeover findings** — Submit immediately if valid
-2. **Import endpoints into Burp Suite** for manual testing
-3. **Review Nuclei findings** — Verify high/critical vulnerabilities
-4. **Run deeper fuzzing** with ffuf or Feroxbuster on interesting paths
-5. **Test parameters** with SQLMap or custom injection scripts
-6. **Screenshot alive hosts** for visual reconnaissance
-7. **Check historical URLs** with gau/waybackurls
-
----
-
-## Security & Ethics
-
-### Authorization Required
-```
-╔═══════════════════════════════════════════════════════════════════╗
-║                    AUTHORIZATION REQUIRED                         ║
-╚═══════════════════════════════════════════════════════════════════╝
-
-This tool performs active security testing.
-Only use on targets where you have explicit written permission.
-Unauthorized testing is illegal.
+```bash
+pip install pytest
+python -m pytest
 ```
 
-### Best Practices
-- Always get written authorization before testing
-- Respect rate limits and target infrastructure
-- Use `--tor` or proxies for sensitive testing
-- Start with `--no-nuclei` on production systems
-- Review findings before reporting
-- Never test critical infrastructure without approval
+## Responsible use
 
----
-
-## Contributing
-
-Contributions welcome! Focus areas:
-
-### High Priority
-- Additional historical URL sources (gau, waybackurls integration)
-- Screenshot integration (httpx -screenshot)
-- Burp/BBRF export formats
-- More takeover fingerprints
-- Report generation (HTML/PDF)
-
-### Medium Priority
-- GitHub/GitLab recon integration
-- Google dorking module
-- Certificate transparency logs
-- Port scanning integration
-- Technology stack analysis
-
-### Enhancement Ideas
-- Cloud bucket enumeration (S3, Azure, GCP)
-- API endpoint fuzzing templates
-- Automated credential checking
-- Notification system (Slack/Discord)
-- Multi-target support
-
-To contribute:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
----
-
-
-## Changelog
-
-### Current
-- Initial release
-- Subfinder & Amass integration
-- Katana JS-aware crawling
-- httpx alive host verification
-- Nuclei vulnerability scanning
-- Subdomain takeover detection
-- Interactive mode
-- Proxy & TOR support
-- Authentication support
-
----
+Only scan systems you own or have explicit written permission to test. Scanning without authorization is illegal in most places. Respect each program's rules and rate limits. You are responsible for how you use this tool.
 
 ## Credits
 
-### Tools Integrated
-- [ProjectDiscovery](https://projectdiscovery.io/) - Subfinder, Katana, Nuclei, httpx
-- [OWASP Amass](https://github.com/owasp-amass/amass)
-- [Playwright](https://playwright.dev/)
+Reconic stands on [ProjectDiscovery](https://projectdiscovery.io/)'s subfinder, httpx, katana and nuclei.
 
----
-
-## Disclaimer
-
-**IMPORTANT**: Only use this tool on targets you have explicit written permission to test. Unauthorized scanning is illegal and unethical. The author is not responsible for any misuse or damage caused by this tool.
-
-This tool is provided "as is" without warranty of any kind. Always verify findings manually before reporting.
-
----
-
-**Made for hunters, by hunters.** 🏆  
-Happy hunting!
-
+Created by Othman Kamal.
