@@ -1,3 +1,3 @@
 """Reconic: scope-safe recon orchestrator."""
 
-__version__ = "2.0.0-dev"
+__version__ = "2.0.0a1"

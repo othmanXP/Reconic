@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 DB_NAME = 'reconic.db'
-KIND_STAGE = {'host': 'enumerate', 'alive': 'probe', 'endpoint': 'crawl', 'takeover': 'takeover', 'vuln': 'nuclei'}
+KIND_STAGE = {'host': 'enumerate', 'resolved': 'resolve', 'alive': 'probe', 'endpoint': 'crawl',
+              'takeover': 'takeover', 'vuln': 'nuclei'}
 KINDS = tuple(KIND_STAGE)
 
 _SCHEMA = """
@@ -53,6 +54,8 @@ def assets_of(results: dict) -> Iterable[Tuple[str, str, dict]]:
     """(kind, key, data) for everything a run found."""
     for host in results['subdomains']:
         yield 'host', host, {}
+    for entry in results.get('resolved', []):
+        yield 'resolved', entry['host'], {'address': entry['addresses'][0] if entry['addresses'] else ''}
     for entry in results['alive']:
         yield 'alive', entry['url'], {'status': entry.get('status'), 'title': entry.get('title', '')}
     for url in results['endpoints']:
@@ -190,3 +193,21 @@ class Store:
             'scope_changed': old['scope'] != new['scope'],
             'kinds': kinds,
         }
+
+
+def highlights(diff: dict) -> Tuple[List[Tuple[str, dict]], int]:
+    """The new items worth announcing, and the number of new endpoints.
+
+    A host that is both newly found and newly resolving is listed once, as a host.
+    """
+    kinds = diff['kinds']
+    new_hosts = {item['key'] for item in kinds['host']['added']}
+    items = []
+    for kind in KINDS:
+        if kind == 'endpoint':
+            continue
+        for item in kinds[kind]['added']:
+            if kind == 'resolved' and item['key'] in new_hosts:
+                continue
+            items.append((kind, item))
+    return items, len(kinds['endpoint']['added'])

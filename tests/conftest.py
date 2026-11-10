@@ -30,6 +30,6 @@ def fake_tools(tmp_path, monkeypatch):
             return []
         return [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
 
-    install('subfinder', 'httpx', 'katana', 'nuclei')
+    install('subfinder', 'dnsx', 'httpx', 'katana', 'nuclei')
     return type('FakeTools', (), {'dir': str(bin_dir), 'install': staticmethod(install),
                                   'calls': staticmethod(calls)})

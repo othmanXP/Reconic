@@ -1,4 +1,4 @@
-"""Stand-in for subfinder/httpx/katana/nuclei so tests never touch the network.
+"""Stand-in for subfinder/dnsx/httpx/katana/nuclei so tests never touch the network.
 
 Behaviour follows the name it is invoked as. Environment switches:
   FAKE_LOG       file that receives one JSON line per invocation (name + args)
@@ -61,6 +61,10 @@ if name == 'subfinder':
         for label in os.environ.get('FAKE_LABELS', 'www,api,admin').split(','):
             print(f"{label}.{domain}")
     print("cdn.other-company.net")
+elif name == 'dnsx':
+    for host in read('-l'):
+        if not host.startswith('dead'):  # names starting with 'dead' have no DNS record
+            print(json.dumps({'host': host, 'a': ['192.0.2.10'], 'status_code': 'NOERROR'}))
 elif name in ('httpx', 'httpx-toolkit'):
     for host in read('-l'):
         print(json.dumps({'url': f"https://{host}", 'input': host, 'status_code': 200,

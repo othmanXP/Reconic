@@ -16,7 +16,7 @@ _BANNER_GLYPHS = {
     'I': ("██╗", "██║", "██║", "██║", "██║", "╚═╝"),
 }
 _BANNER_TAGLINE = "Automated Reconnaissance Framework"
-_BANNER_PIPELINE = ("subfinder", "httpx", "katana", "nuclei")
+_BANNER_PIPELINE = ("subfinder", "dnsx", "httpx", "katana", "nuclei")
 _BANNER_AUTHOR = "by Othman Kamal"
 
 # Standard ANSI attributes only, so the banner follows the user's terminal theme.
@@ -59,9 +59,9 @@ def render_banner(color: bool = True, unicode_ok: bool = True, width: int = 80) 
 
     out.append("")
     out.append(f" {bold}{_BANNER_TAGLINE}{reset}"
-               f"{' ' * (art_width - len(_BANNER_TAGLINE) - len(version))}{accent}{version}{reset}")
+               f"{' ' * max(1, art_width - len(_BANNER_TAGLINE) - len(_BANNER_AUTHOR))}{dim}{_BANNER_AUTHOR}{reset}")
     out.append(f" {pipeline}"
-               f"{' ' * (art_width - len(pipeline_plain) - len(_BANNER_AUTHOR))}{dim}{_BANNER_AUTHOR}{reset}")
+               f"{' ' * max(1, art_width - len(pipeline_plain) - len(version))}{accent}{version}{reset}")
     out.append(f" {dim}{'─' * art_width}{reset}")
     return '\n'.join(out) + '\n'
 

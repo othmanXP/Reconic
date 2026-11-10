@@ -23,20 +23,21 @@
 
 ---
 
-Reconic runs [subfinder](https://github.com/projectdiscovery/subfinder), [httpx](https://github.com/projectdiscovery/httpx), [katana](https://github.com/projectdiscovery/katana) and [nuclei](https://github.com/projectdiscovery/nuclei) as one pipeline. It does not reimplement them. What it adds is the part that is easy to get wrong when you chain them by hand:
+Reconic runs [subfinder](https://github.com/projectdiscovery/subfinder), [dnsx](https://github.com/projectdiscovery/dnsx), [httpx](https://github.com/projectdiscovery/httpx), [katana](https://github.com/projectdiscovery/katana) and [nuclei](https://github.com/projectdiscovery/nuclei) as one pipeline. It does not reimplement them. What it adds is the part that is easy to get wrong when you chain them by hand:
 
 | | |
 |---|---|
 | **Scope is enforced everywhere** | Hosts are checked against your scope before and after every tool. Give it one host and it tests one host; it never widens to the parent domain. |
 | **Failures are loud** | A missing tool, a non-zero exit or a timeout marks the stage as failed, shows the tool's own error, and makes the run exit non-zero. Partial results are kept and labelled as partial. |
-| **Every run is remembered** | Results go into a local SQLite history. Each scan ends with what is new since the last one, and `reconic diff` shows everything added and removed. |
+| **Every run is remembered** | Results go into a local SQLite history. Each scan ends with what is new since the last one, `reconic diff` shows everything added and removed, and a webhook can send you only the new items. |
 
 ## How it works
 
 ```mermaid
 flowchart LR
     S([scope]) --> E[enumerate<br/>subfinder]
-    E --> P[probe<br/>httpx]
+    E --> D[resolve<br/>dnsx]
+    D --> P[probe<br/>httpx]
     P --> C[crawl<br/>katana]
     P --> N[scan<br/>nuclei]
     E --> T[takeover<br/>nuclei]
@@ -48,9 +49,10 @@ flowchart LR
 | Stage | Tool | What it does |
 |---|---|---|
 | `enumerate` | subfinder | Finds subdomains of every wildcard domain in scope. Passive: nothing is sent to the target. |
+| `resolve` | dnsx | Keeps the hosts that have an address, so dead names are not probed. Optional: without dnsx every host is passed on. |
 | `probe` | httpx | Finds which hosts answer over HTTP, with status, title and technologies. |
 | `crawl` | katana | Collects endpoints from pages, JavaScript, `robots.txt` and `sitemap.xml`. |
-| `takeover` | nuclei | Runs the takeover templates against every in-scope host. |
+| `takeover` | nuclei | Runs the takeover templates against every in-scope host, including names that no longer resolve. |
 | `nuclei` | nuclei | Runs critical, high and medium templates against the alive hosts. |
 
 ## Install
@@ -67,6 +69,7 @@ Then install the tools it drives (Go 1.21+):
 
 ```bash
 go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest          # optional
 go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
@@ -78,6 +81,7 @@ Check what Reconic found:
 $ reconic doctor
   Tools
   ✓ subfinder  v2.14.0    /usr/bin/subfinder
+  ✓ dnsx       v1.3.1     /home/you/go/bin/dnsx
   ✓ httpx      v1.9.0     /home/you/go/bin/httpx
   ✓ katana     v1.6.1     /home/you/go/bin/katana
   ✓ nuclei     v3.9.0     /usr/bin/nuclei
@@ -97,6 +101,12 @@ reconic scan -u app.example.com
 # Enumeration only; nothing is sent to the target
 reconic scan -d example.com --passive
 
+# Enumerate and resolve DNS, with no HTTP request to the target
+reconic scan -d example.com --dns-only
+
+# Scheduled monitoring: only hear about what is new
+reconic scan -d example.com -y --notify https://hooks.slack.com/services/...
+
 # A bug bounty program: scope file, gentle rate, your identifying header
 reconic scan --scope scope.txt --rate-limit 20 -H "X-Bug-Bounty: yourname"
 ```
@@ -114,6 +124,8 @@ $ reconic scan -d example.com -x admin.example.com
 
   ▸ enumerate  subfinder on 1 domain(s)
   ✓ enumerate  3 host(s) · 2 out of scope dropped · 4.2s
+  ▸ resolve    dnsx on 3 host(s)
+  ✓ resolve    3 resolving · 1.1s
   ▸ probe      httpx on 3 host(s)
   ✓ probe      3 alive · 1.9s
   ▸ crawl      katana on 3 URL(s), depth 3
@@ -206,6 +218,22 @@ vulns      no change
 - A note is shown when the two runs used different scopes.
 - `scan --name NAME` sets the name a target is tracked under. By default it is the first scope pattern.
 
+### Notifications
+
+`--notify WEBHOOK` posts what is new to a Slack or Discord webhook, or as JSON to any other URL. The option can be repeated, and URLs are also read from the `RECONIC_NOTIFY` environment variable so they stay out of your shell history.
+
+```text
+Reconic: example.com run 7, 6 new
++ host staging.example.com
++ alive https://staging.example.com  [200]
++ vuln [high] exposed-env https://staging.example.com/.env
++ 3 endpoint(s)
+```
+
+- Nothing is sent when a run finds nothing new, so a daily scheduled scan stays quiet until something changes.
+- The first run of a target sends totals and findings only, not every host.
+- A failed notification is reported but does not fail the scan. Notifications are sent directly, not through `--proxy`.
+
 ## Options
 
 `reconic scan`:
@@ -213,7 +241,8 @@ vulns      no change
 | Option | Meaning |
 |---|---|
 | `--passive` | enumeration only; nothing is sent to the target |
-| `--no-crawl`, `--no-takeover`, `--no-nuclei` | skip a stage |
+| `--dns-only` | enumerate and resolve only; no HTTP request is sent to the target |
+| `--no-resolve`, `--no-crawl`, `--no-takeover`, `--no-nuclei` | skip a stage |
 | `--pick` | choose which alive hosts to continue with after probing |
 | `--proxy URL`, `--tor` | send every tool through a proxy; `--tor` uses `socks5://127.0.0.1:9050` |
 | `-H "Name: value"`, `--cookie COOKIE` | header sent with every request to the target |
@@ -226,12 +255,14 @@ vulns      no change
 | `--severity LIST` | nuclei severities (default `critical,high,medium`) |
 | `--templates DIR` | nuclei: custom templates |
 | `--stage-timeout MIN` | hard limit per stage; the tool is stopped after it (default 60) |
+| `--notify WEBHOOK` | send what is new to a Slack, Discord or generic webhook |
+| `--name NAME` | name the target is tracked under in the history |
 | `-o DIR` | where run directories and the history are kept (default `./reconic_output`) |
 | `-y` | confirm authorization without the prompt |
 
 Things worth knowing:
 
-- **Proxy.** A proxy applies to every tool. A tool that cannot be proxied refuses to run instead of connecting directly. The tools may still resolve DNS locally.
+- **Proxy.** A proxy applies to every tool. A tool that cannot be proxied refuses to run instead of connecting directly, and the `resolve` stage is skipped because dnsx cannot use one. The other tools may still resolve DNS locally.
 - **Headers.** Auth headers go to httpx, katana and nuclei. They are never sent to subfinder's third-party sources, and they are redacted in the saved command lines.
 - **Timeouts.** When a stage hits its limit, the tool and everything it started is stopped, and whatever it had produced is kept.
 
@@ -246,6 +277,7 @@ reconic_output/
     └── 20261110-235317/
         ├── results.json            everything, including each stage's status
         ├── subdomains.txt
+        ├── resolved.txt
         ├── alive.txt
         ├── endpoints.txt
         ├── findings.jsonl
@@ -256,7 +288,7 @@ reconic_output/
 
 ## Status
 
-Reconic 2 is an alpha rewrite. It has been run end to end against a real site with a single-host scope. Subdomain enumeration on a real domain is covered by the test suite but has not yet had the same real-world use. Expect rough edges and please report them.
+Reconic 2 is an alpha rewrite. It has been run end to end against a real site with a single-host scope, and enumeration and DNS resolution have been run against a real wildcard domain. A full active scan of a large wildcard scope has not been done yet. Expect rough edges and please report them.
 
 ## Development
 
@@ -277,6 +309,6 @@ Only scan systems you own or have explicit written permission to test. Scanning 
 
 ## Credits
 
-Reconic stands on [ProjectDiscovery](https://projectdiscovery.io/)'s subfinder, httpx, katana and nuclei.
+Reconic stands on [ProjectDiscovery](https://projectdiscovery.io/)'s subfinder, dnsx, httpx, katana and nuclei.
 
 Created by Othman Kamal.

@@ -31,6 +31,7 @@ class ToolSpec:
     rate_flag: Optional[str] = None
     common_flags: Tuple[str, ...] = ('-silent', '-nc', '-duc')
     install: str = ''
+    optional: bool = False              # the pipeline works without it
 
 
 @dataclass

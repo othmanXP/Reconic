@@ -10,21 +10,24 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import List, Optional
 
 from . import __version__
 from .banner import print_banner
+from .notify import (NotifyError, build_message, check_url, describe, first_run_message, payload_for,
+                     send)
 from .pipeline import TOOLS, Pipeline, ScanConfig, StageReport, failed_stages
 from .runner import Runner, RunOptions
 from .scope import Scope, host_of
-from .store import DB_NAME, KINDS, Store, StoreError
+from .store import DB_NAME, KINDS, Store, StoreError, highlights
 
 TOR_PROXY = 'socks5://127.0.0.1:9050'
 _COLORS = {'red': 31, 'green': 32, 'yellow': 33, 'cyan': 36, 'dim': 2, 'bold': 1}
 _SEVERITY_COLORS = {'critical': 'red', 'high': 'red', 'medium': 'yellow'}
 
 
-_KIND_LABELS = {'host': 'hosts', 'alive': 'alive', 'endpoint': 'endpoints', 'takeover': 'takeovers',
+_KIND_LABELS = {'host': 'hosts', 'resolved': 'resolving', 'alive': 'alive', 'endpoint': 'endpoints', 'takeover': 'takeovers',
                 'vuln': 'vulns'}
 
 
@@ -40,7 +43,7 @@ def _say(text: str = '') -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog='reconic', description='Scope-safe recon orchestrator for subfinder, httpx, katana and nuclei.')
+        prog='reconic', description='Scope-safe recon orchestrator for subfinder, dnsx, httpx, katana and nuclei.')
     parser.add_argument('--version', action='version', version=f"reconic {__version__}")
     parser.add_argument('--no-banner', action='store_true', help='do not print the banner')
     sub = parser.add_subparsers(dest='command', metavar='{scan,diff,runs,doctor}')
@@ -62,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser(
         'scan', help='run the recon pipeline',
-        description='Runs enumerate -> probe -> crawl -> takeover -> nuclei, never leaving the scope.')
+        description='Runs enumerate -> resolve -> probe -> crawl -> takeover -> nuclei, never leaving the scope.')
     target = scan.add_argument_group('scope')
     target.add_argument('-d', '--domain', action='append', default=[], metavar='DOMAIN',
                         help='domain whose subdomains are in scope and get enumerated (repeatable)')
@@ -79,6 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
     stages.add_argument('--no-crawl', action='store_true', help='skip katana')
     stages.add_argument('--no-takeover', action='store_true', help='skip the takeover check')
     stages.add_argument('--no-nuclei', action='store_true', help='skip the nuclei vulnerability scan')
+    stages.add_argument('--dns-only', action='store_true',
+                        help='enumerate and resolve only; no HTTP request is sent to the target')
+    stages.add_argument('--no-resolve', action='store_true',
+                        help='skip the DNS check and probe every enumerated host')
     stages.add_argument('--pick', action='store_true',
                         help='choose which alive hosts to continue with after probing')
 
@@ -106,6 +113,9 @@ def build_parser() -> argparse.ArgumentParser:
     out = scan.add_argument_group('output')
     out.add_argument('-o', '--output-dir', type=Path, default=Path('reconic_output'), metavar='DIR',
                      help='where run directories and the history are kept (default ./reconic_output)')
+    out.add_argument('--notify', action='append', default=[], metavar='WEBHOOK',
+                     help='Slack, Discord or generic webhook that receives what is new after the run '
+                          '(repeatable; also read from the RECONIC_NOTIFY environment variable)')
     out.add_argument('--name', metavar='NAME',
                      help='name this target is tracked under in the history (default: first scope pattern)')
     out.add_argument('-y', '--yes', action='store_true',
@@ -183,7 +193,7 @@ def _stage_end(report: StageReport) -> None:
     if report.status == 'skipped':
         _say(f"  {_paint('–', 'dim')} {report.name:<10} {_paint('skipped: ' + report.detail, 'dim')}")
         return
-    noun = {'enumerate': 'host(s)', 'probe': 'alive', 'crawl': 'endpoint(s)'}.get(report.name, 'finding(s)')
+    noun = {'enumerate': 'host(s)', 'resolve': 'resolving', 'probe': 'alive', 'crawl': 'endpoint(s)'}.get(report.name, 'finding(s)')
     parts = [f"{report.count} {noun}"]
     if report.out_of_scope:
         parts.append(f"{report.out_of_scope} out of scope dropped")
@@ -204,6 +214,10 @@ async def _doctor() -> int:
             tool = await runner.resolve(spec)
             if tool:
                 _say(f"  {_paint('✓', 'green')} {spec.name:<10} v{tool.version_text:<9} {_paint(tool.path, 'dim')}")
+            elif spec.optional:
+                _say(f"  {_paint('–', 'dim')} {spec.name:<10} not found (optional)")
+                _say(f"    {' ' * 10} {_paint(spec.install, 'dim')}")
+                continue
             else:
                 missing += 1
                 _say(f"  {_paint('✗', 'red')} {spec.name:<10} not found")
@@ -223,7 +237,7 @@ def _confirm(scope: Scope, config: ScanConfig, yes: bool) -> bool:
     if config.options.headers:
         _say(f"  Auth        {len(config.options.headers)} header(s) sent to every in-scope host")
     _say()
-    if config.passive or yes:
+    if config.passive or config.dns_only or yes:
         return True
     if not sys.stdin.isatty():
         _say(_paint("  Active stages need confirmation: pass --yes if you are authorized to test this scope.", 'red'))
@@ -256,47 +270,53 @@ def _when(stamp: str) -> str:
     return stamp[:16].replace('T', ' ') + ' UTC'
 
 
-def _added_text(kind: str, item: dict) -> str:
-    text = item['key']
-    if kind in ('takeover', 'vuln'):
-        text = f"[{item.get('severity') or 'unknown'}] {text}"
-    elif kind == 'alive' and item.get('status'):
-        text = f"{text}  [{item['status']}]"
-    return text + ("  (seen before)" if item['seen_before'] else "")
-
-
-def _record(results: dict, run_dir: Path, output_dir: Path) -> None:
-    """Save the run to the history and report what is new since the previous one."""
+def _record(results: dict, run_dir: Path, output_dir: Path, webhooks: List[str]) -> None:
+    """Save the run to the history, report what is new since the previous one, and notify."""
+    target = results['target']
     try:
         with Store(output_dir / DB_NAME) as store:
             run_id = store.record(results, run_dir)
-            previous = store.previous_run(results['target'], run_id)
+            previous = store.previous_run(target, run_id)
             diff = store.diff(previous, run_id) if previous else None
     except (sqlite3.Error, StoreError) as error:
         _say(_paint(f"  History not updated: {error}", 'red'))
         return
-    if diff is None:
-        _say(f"  Run {run_id}: first recorded run for {results['target']}")
+    items, new_endpoints = highlights(diff) if diff else ([], 0)
+
+    if previous is None:
+        _say(f"  Run {run_id}: first recorded run for {target}")
+    else:
+        _say(f"  Run {run_id}: new since run {previous} ({_when(diff['old']['started'])})")
+        if diff['scope_changed']:
+            _say(_paint("    the scope changed between these runs", 'yellow'))
+        for kind in KINDS:
+            entry = diff['kinds'][kind]
+            if not entry['comparable'] and kind != 'resolved':
+                _say(_paint(f"    {_KIND_LABELS[kind]} not compared: {entry['reason']}", 'dim'))
+        for kind, item in items:
+            _say(f"    {_paint('+', 'green')} {kind:<9} {describe(kind, item)}")
+        if new_endpoints:
+            _say(f"    {_paint('+', 'green')} {new_endpoints} endpoint(s)")
+        if not items and not new_endpoints:
+            _say(_paint("    nothing new", 'dim'))
+        _say(_paint(f"    full list: reconic diff {target}", 'dim'))
+
+    if not webhooks:
         return
-    _say(f"  Run {run_id}: new since run {previous} ({_when(diff['old']['started'])})")
-    if diff['scope_changed']:
-        _say(_paint("    the scope changed between these runs", 'yellow'))
-    quiet = True
-    for kind in KINDS:
-        entry = diff['kinds'][kind]
-        if not entry['comparable']:
-            quiet = False
-            _say(_paint(f"    {_KIND_LABELS[kind]} not compared: {entry['reason']}", 'dim'))
-        elif kind == 'endpoint' and entry['added']:
-            quiet = False
-            _say(f"    {_paint('+', 'green')} {len(entry['added'])} endpoint(s)")
-        else:
-            for item in entry['added']:
-                quiet = False
-                _say(f"    {_paint('+', 'green')} {kind:<9} {_added_text(kind, item)}")
-    if quiet:
-        _say(_paint("    nothing new", 'dim'))
-    _say(_paint(f"    full list: reconic diff {results['target']}", 'dim'))
+    if previous is None:
+        message = first_run_message(target, run_id, results)
+    else:
+        message = build_message(target, run_id, items, new_endpoints)
+    if message is None:
+        _say(_paint("  Nothing new, so no notification was sent", 'dim'))
+        return
+    for url in webhooks:
+        host = urlsplit(url).hostname
+        try:
+            send(url, payload_for(url, message, target, run_id))
+            _say(f"  Notified {host}")
+        except NotifyError as error:
+            _say(_paint(f"  Notification to {host} failed: {error}", 'red'))
 
 
 def _open_history(args: argparse.Namespace) -> Optional[Store]:
@@ -379,7 +399,7 @@ def _diff(args: argparse.Namespace) -> int:
         else:
             print(f"{label} +{len(entry['added'])} -{len(entry['removed'])}")
             for item in entry['added']:
-                print(f"  {_paint('+', 'green', out)} {_added_text(kind, item)}")
+                print(f"  {_paint('+', 'green', out)} {describe(kind, item)}")
             for key in entry['removed']:
                 print(f"  {_paint('-', 'red', out)} {key}")
     return 0
@@ -403,13 +423,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             scope = build_scope(args)
             options = build_options(args)
+            webhooks = [check_url(url) for url in
+                        args.notify + os.environ.get('RECONIC_NOTIFY', '').replace(',', ' ').split()]
         except (ValueError, OSError) as error:
             _say(_paint(f"  error: {error}", 'red'))
             return 2
 
         config = ScanConfig(
             scope=scope, name=args.name, output_dir=args.output_dir, options=options,
-            passive=args.passive, crawl=not args.no_crawl, takeover=not args.no_takeover,
+            passive=args.passive, dns_only=args.dns_only, resolve=not args.no_resolve, crawl=not args.no_crawl, takeover=not args.no_takeover,
             nuclei=not args.no_nuclei, all_sources=args.all_sources, threads=args.threads,
             depth=args.depth, headless=args.headless, crawl_minutes=args.crawl_minutes,
             severity=args.severity, templates=args.templates, stage_timeout=args.stage_timeout * 60,
@@ -422,7 +444,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             picker=_pick if args.pick and sys.stdin.isatty() else None)
         results = asyncio.run(pipeline.run())
         _summary(results, pipeline.run_dir)
-        _record(results, pipeline.run_dir, args.output_dir)
+        _record(results, pipeline.run_dir, args.output_dir, webhooks)
         _say()
         print(pipeline.run_dir / 'results.json')
         return 1 if failed_stages(results) else 0

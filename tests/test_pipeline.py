@@ -112,3 +112,48 @@ def test_runs_never_share_a_directory(fake_tools, tmp_path):
     second, _ = scan(fake_tools, tmp_path, Scope(['a.example.com']))
     assert first.run_dir != second.run_dir
     assert (first.run_dir / 'results.json').exists() and (second.run_dir / 'results.json').exists()
+
+
+def test_resolve_drops_dead_hosts_before_probing(fake_tools, tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_LABELS', 'www,dead1,dead2')
+    pipeline, results = scan(fake_tools, tmp_path, Scope(['*.example.com']))
+    assert results['subdomains'] == ['dead1.example.com', 'dead2.example.com', 'www.example.com']
+    assert [r['host'] for r in results['resolved']] == ['www.example.com']
+    assert stage(results, 'resolve')['count'] == 1
+    assert (pipeline.run_dir / 'raw' / 'probe.input.txt').read_text().split() == ['www.example.com']
+    # the takeover check still sees names that no longer resolve: that is where dangling records live
+    assert 'dead1.example.com' in (pipeline.run_dir / 'raw' / 'takeover.input.txt').read_text()
+
+
+def test_missing_dnsx_is_skipped_not_fatal(fake_tools, tmp_path):
+    (tmp_path / 'bin' / 'dnsx').unlink()
+    _, results = scan(fake_tools, tmp_path, domain_scope())
+    assert stage(results, 'resolve')['status'] == 'skipped'
+    assert len(results['alive']) == 3 and failed_stages(results) == []
+
+
+def test_failed_resolve_passes_every_host_on(fake_tools, tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_FAIL', 'dnsx')
+    _, results = scan(fake_tools, tmp_path, domain_scope())
+    assert stage(results, 'resolve')['status'] == 'failed'
+    assert len(results['alive']) == 3
+
+
+def test_proxy_skips_resolve_instead_of_leaking_dns(fake_tools, tmp_path):
+    _, results = scan(fake_tools, tmp_path, domain_scope(), options=RunOptions(proxy='socks5://127.0.0.1:9050'))
+    assert stage(results, 'resolve')['status'] == 'skipped'
+    assert 'dnsx' not in [call['tool'] for call in fake_tools.calls()]
+
+
+def test_dns_only_sends_no_http(fake_tools, tmp_path):
+    _, results = scan(fake_tools, tmp_path, domain_scope(), dns_only=True)
+    assert [call['tool'] for call in fake_tools.calls()] == ['subfinder', 'dnsx']
+    assert len(results['resolved']) == 3
+    assert stage(results, 'probe')['detail'] == 'DNS only'
+
+
+def test_no_host_resolving_skips_probe(fake_tools, tmp_path, monkeypatch):
+    monkeypatch.setenv('FAKE_LABELS', 'dead1')
+    _, results = scan(fake_tools, tmp_path, Scope(['*.example.com']))
+    assert stage(results, 'probe')['detail'] == 'no host resolves'
+    assert 'httpx' not in [call['tool'] for call in fake_tools.calls()]

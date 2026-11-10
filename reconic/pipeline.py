@@ -1,4 +1,4 @@
-"""Recon pipeline: enumerate -> probe -> crawl -> takeover -> nuclei.
+"""Recon pipeline: enumerate -> resolve -> probe -> crawl -> takeover -> nuclei.
 
 Scope is applied to the input and the output of every stage. Each run writes
 into its own directory, so results can never be mixed with an earlier run.
@@ -19,6 +19,9 @@ from .scope import Scope
 SUBFINDER = ToolSpec(
     'subfinder', ('subfinder',), proxy_flag='-proxy', rate_flag='-rl',
     install='go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest')
+DNSX = ToolSpec(
+    'dnsx', ('dnsx',), rate_flag='-rl', optional=True,
+    install='go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest')
 HTTPX = ToolSpec(
     'httpx', ('httpx', 'httpx-toolkit'), proxy_flag='-http-proxy', header_flag='-H', rate_flag='-rl',
     install='go install github.com/projectdiscovery/httpx/cmd/httpx@latest')
@@ -31,8 +34,8 @@ NUCLEI = ToolSpec(
     common_flags=('-silent', '-nc'),
     install='go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest')
 
-TOOLS = (SUBFINDER, HTTPX, KATANA, NUCLEI)
-STAGES = ('enumerate', 'probe', 'crawl', 'takeover', 'nuclei')
+TOOLS = (SUBFINDER, DNSX, HTTPX, KATANA, NUCLEI)
+STAGES = ('enumerate', 'resolve', 'probe', 'crawl', 'takeover', 'nuclei')
 
 
 @dataclass
@@ -42,6 +45,8 @@ class ScanConfig:
     output_dir: Path = Path('reconic_output')
     options: RunOptions = field(default_factory=RunOptions)
     passive: bool = False
+    dns_only: bool = False
+    resolve: bool = True
     crawl: bool = True
     takeover: bool = True
     nuclei: bool = True
@@ -151,6 +156,38 @@ class Pipeline:
         self._finish(report)
         return hosts
 
+    async def _resolve(self, hosts: List[str]) -> Tuple[List[str], List[dict]]:
+        """Drop hosts with no address so later stages don't waste requests on dead names.
+
+        Returns the hosts to probe and the DNS records found. Whenever resolution
+        cannot be trusted (skipped, failed, timed out) every host is passed on.
+        """
+        why = ''
+        if not self.config.resolve:
+            why = 'disabled'
+        elif self.config.options.proxy:
+            why = 'dnsx cannot use a proxy; every host is passed on'
+        elif await self.runner.resolve(DNSX) is None:
+            why = 'dnsx is not installed; every host is passed on'
+        if why:
+            self._skip('resolve', why)
+            return hosts, []
+        self.on_start('resolve', f"dnsx on {len(hosts)} host(s)")
+        report = StageReport('resolve')
+        args = ['-l', self._input_file('resolve', hosts), '-a', '-aaaa', '-cname', '-resp', '-j']
+        wanted, records = set(hosts), {}
+        for item in _json_lines(await self._tool(report, DNSX, args)):
+            host = (item.get('host') or '').lower().rstrip('.')
+            addresses = (item.get('a') or []) + (item.get('aaaa') or [])
+            if host in wanted and addresses:
+                records[host] = {'host': host, 'addresses': addresses, 'cname': item.get('cname') or []}
+        resolved = [records[host] for host in hosts if host in records]
+        report.count = len(resolved)
+        self._finish(report)
+        if report.status != 'ok':
+            return hosts, resolved
+        return [entry['host'] for entry in resolved], resolved
+
     async def _probe(self, hosts: List[str]) -> List[dict]:
         self.on_start('probe', f"httpx on {len(hosts)} host(s)")
         report = StageReport('probe')
@@ -239,6 +276,7 @@ class Pipeline:
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         hosts = await self._enumerate()
+        resolved: List[dict] = []
         alive: List[dict] = []
         endpoints: List[str] = []
         findings: List[dict] = []
@@ -248,7 +286,15 @@ class Pipeline:
             for name in STAGES[1:]:
                 self._skip(name, blocked)
         else:
-            alive = await self._probe(hosts)
+            live_hosts, resolved = await self._resolve(hosts)
+        if not blocked and cfg.dns_only:
+            for name in STAGES[2:]:
+                self._skip(name, 'DNS only')
+        elif not blocked:
+            if live_hosts:
+                alive = await self._probe(live_hosts)
+            else:
+                self._skip('probe', 'no host resolves')
             if alive and self.picker:
                 alive = self.picker(alive)
             urls = [entry['url'] for entry in alive]
@@ -297,6 +343,7 @@ class Pipeline:
             'tools': self.runner.resolved(),
             'stages': [asdict(report) for report in self.reports],
             'subdomains': hosts,
+            'resolved': resolved,
             'alive': alive,
             'endpoints': endpoints,
             'findings': unique,
@@ -308,6 +355,8 @@ class Pipeline:
         out = self.run_dir
         (out / 'results.json').write_text(json.dumps(results, indent=2) + '\n', encoding='utf-8')
         (out / 'subdomains.txt').write_text(''.join(f"{h}\n" for h in results['subdomains']), encoding='utf-8')
+        (out / 'resolved.txt').write_text(
+            ''.join(f"{r['host']} {' '.join(r['addresses'])}\n" for r in results['resolved']), encoding='utf-8')
         (out / 'alive.txt').write_text(''.join(f"{a['url']}\n" for a in results['alive']), encoding='utf-8')
         (out / 'endpoints.txt').write_text(''.join(f"{e}\n" for e in results['endpoints']), encoding='utf-8')
         (out / 'findings.jsonl').write_text(
