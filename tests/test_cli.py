@@ -61,4 +61,5 @@ def test_banner_lines_align_and_fall_back():
     assert render_banner(unicode_ok=False).startswith('RECONIC v')
     assert render_banner(width=40).count('\n') == 1
     assert '\033[' not in render_banner(color=False)
-    assert '38;5;' in render_banner(truecolor=False) and '38;2;' not in render_banner(truecolor=False)
+    colored = render_banner(color=True)
+    assert '\033[1m' in colored and '38;2;' not in colored and '38;5;' not in colored  # theme colours only

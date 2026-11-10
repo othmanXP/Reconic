@@ -7,9 +7,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.9%2B-22d3ee?style=flat-square&labelColor=0b0f19" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/dependencies-none-a78bfa?style=flat-square&labelColor=0b0f19" alt="No Python dependencies">
-  <img src="https://img.shields.io/badge/status-alpha-f472b6?style=flat-square&labelColor=0b0f19" alt="Status: alpha">
+  <img src="https://img.shields.io/badge/python-3.9%2B-555?style=flat-square" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/dependencies-none-555?style=flat-square" alt="No Python dependencies">
+  <img src="https://img.shields.io/badge/status-alpha-555?style=flat-square" alt="Status: alpha">
+  <img src="https://img.shields.io/badge/license-MIT-555?style=flat-square" alt="License: MIT">
 </p>
 
 <p align="center">
@@ -269,6 +270,10 @@ python -m pytest
 ## Responsible use
 
 Only scan systems you own or have explicit written permission to test. Scanning without authorization is illegal in most places. Respect each program's rules and rate limits. You are responsible for how you use this tool.
+
+## License
+
+[MIT](LICENSE)
 
 ## Credits
 
