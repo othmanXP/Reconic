@@ -15,6 +15,7 @@
   <a href="#install">Install</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#scope-firewall">Scope firewall</a> ·
+  <a href="#programs-and-rules">Programs and rules</a> ·
   <a href="#scope">Scope</a> ·
   <a href="#history-and-diff">History and diff</a> ·
   <a href="#options">Options</a>
@@ -25,6 +26,7 @@
 Reconic runs [subfinder](https://github.com/projectdiscovery/subfinder), [dnsx](https://github.com/projectdiscovery/dnsx), [httpx](https://github.com/projectdiscovery/httpx), [katana](https://github.com/projectdiscovery/katana) and [nuclei](https://github.com/projectdiscovery/nuclei) as one pipeline. It does not reimplement them; it adds the parts that are easy to get wrong when you chain them by hand.
 
 - **🛡️ Scope is enforced on the wire.** httpx, katana and nuclei run behind a local [scope firewall](#scope-firewall) that refuses any connection to an out-of-scope host. Every run keeps a receipt of what was contacted and what was blocked.
+- **📜 It knows the program's rules.** `--program h1:handle` imports a HackerOne program's scope, and a small [rules file](#programs-and-rules) adds what the policy says: rate limit, required header, forbidden paths, allowed hours. Each run ends with a one-page `receipt.md` you can attach to a report.
 - **🎯 Scope is never widened.** Hosts are checked before and after every tool. Give it one host and it tests one host, not the parent domain.
 - **🔊 Failures are loud.** A missing tool, a crash or a timeout marks the stage as failed with the tool's own error, and the run exits non-zero. Partial results are kept and labelled, also after Ctrl-C.
 - **🔁 Every run is remembered.** Each scan ends with what is new since the last one, and a webhook can send you only the new items.
@@ -125,6 +127,7 @@ reconic scan -d example.com                  # a domain and all its subdomains
 reconic scan -u app.example.com              # one host, no enumeration
 reconic scan -d example.com --passive        # enumeration only, nothing sent to the target
 reconic scan --scope scope.txt --rate-limit 20 -H "X-Bug-Bounty: yourname"
+reconic scan --program h1:acme               # a HackerOne program's scope and your rules for it
 reconic scan -d example.com -y --notify https://hooks.slack.com/services/...
 ```
 
@@ -155,6 +158,74 @@ With `--proxy` or `--tor`, the firewall chains to your proxy and the tools are g
 
 </details>
 
+## Programs and rules
+
+`--program h1:<handle>` builds the scope from the program's structured scopes on HackerOne: in-scope assets are included and out-of-scope assets excluded. It needs your [API identifier and token](https://hackerone.com/settings/api_token/edit) in `HACKERONE_API_USERNAME` and `HACKERONE_API_TOKEN`.
+
+```console
+$ reconic scan --program h1:acme
+  Program     h1:acme: 4 in scope, 2 out of scope · cached as program_scope.json
+    · com.acme.android: skipped: not a web asset (GOOGLE_PLAY_APP_ID)
+    · https://acme.com/api/: skipped: only /api/ is in scope and Reconic tests whole hosts; ...
+  Rules       5 req/s · header X-HackerOne-Research · forbid /logout /checkout · hours 22:00-06:00 UTC
+```
+
+Asset lists can be imported, but rules live in the policy's free text. So each program gets a small rules file that you fill in once from its policy. The first `--program` run writes a template to `~/.config/reconic/programs/h1-<handle>.rules`:
+
+```text
+rate-limit: 5                              max requests per second, given to every tool
+header: X-HackerOne-Research: yourname     sent with every request (repeatable)
+forbid: /logout                            path no tool is pointed at or crawls into (repeatable)
+forbid: /account/*/delete
+exclude: blog.acme.com                     extra out-of-scope pattern (repeatable)
+hours: 22:00-06:00                         scans only start inside this window
+timezone: Europe/Amsterdam                 time zone of hours (default UTC)
+```
+
+A rule can only make a scan gentler or narrower: the lower of `rate-limit` and `--rate-limit` wins, and headers and exclusions add to the ones from flags. A misspelled rule is an error, not silently ignored. `--rules FILE` uses another file, with or without `--program`.
+
+Every active run writes `receipt.md`: hosts contacted and how often, everything blocked and why, and each tool's route, rate limit and headers (names only). It ends with the SHA-256 of the full `scope_receipt.jsonl`.
+
+<details>
+<summary><b>How program entries are read</b></summary>
+<br>
+
+Identifiers on HackerOne are typed by hand. Each entry becomes scope patterns, or is skipped with a note. When an entry cannot be read exactly it is skipped, never guessed, so an import does not widen the scope.
+
+| Entry | Becomes |
+|---|---|
+| `https://app.acme.com/` | `app.acme.com` |
+| `app.acme.com:8443` | `app.acme.com`, probed on port 8443 |
+| `*.acme.com`, `https://*.acme.com/*` | `*.acme.com` |
+| `a.acme.com, b.acme.com` | both hosts |
+| `www.acme.com (main site)` | `www.acme.com` |
+| `*acme.com` | `acme.com` and `*.acme.com`, not `evil-acme.com` |
+| `10.0.0.0/24`, `192.0.2.1-192.0.2.20` | the networks they cover |
+| `https://acme.com/api/` in scope | skipped: Reconic tests whole hosts, so taking `acme.com` would test more than `/api/` |
+| `https://acme.com/blog` out of scope | `acme.com` is excluded entirely, which is narrower |
+| app store IDs, source code, hardware, … | skipped with a note |
+| `Any host on acme.com`, `*.com` | skipped with a note; when such an entry is out of scope it is shown as a warning, since it is **not** excluded |
+
+The fetched scope, with the raw API answer, is saved as `program_scope.json` in the run directory, and `results.json` records what was imported and every note. The request to HackerOne goes directly to `api.hackerone.com`, not through `--proxy`. Nothing is sent to the target.
+
+</details>
+
+<details>
+<summary><b>How each rule is enforced</b></summary>
+<br>
+
+| Rule | Enforced by |
+|---|---|
+| `rate-limit` | every tool's own rate flag (`-rl`) |
+| `header` | every tool that contacts the target (`-H`). For plain-HTTP requests the firewall also checks the header is on the wire and records the result in the receipt. |
+| `forbid` | URLs with a forbidden path are not handed to katana or nuclei. katana gets them as out-of-scope crawl rules. Plain-HTTP requests for them are refused by the firewall. |
+| `exclude` | added to the scope, so it is enforced everywhere the scope is |
+| `hours` | checked before an active scan starts. A scan that is already running is not stopped when the window closes. Passive and DNS-only runs send nothing to the target and are not held to it. |
+
+HTTPS is tunnelled through the firewall unopened, so for HTTPS the firewall sees hosts but not paths or headers. There the path and header rules rely on the tools' own flags, and the receipt says so.
+
+</details>
+
 ## Scope
 
 Exclusions always win.
@@ -162,6 +233,7 @@ Exclusions always win.
 | Pattern | Matches | Scan starts from |
 |---|---|---|
 | `app.example.com` | exactly that host | the host itself |
+| `app.example.com:8443` | that host, on any port | probing that port |
 | `*.example.com` | every subdomain at any depth, not `example.com` itself | enumerating `example.com` |
 | `api-*.example.com` | `api-v2.example.com`, `api-eu.example.com`, … | enumerating `example.com`, keeping matches |
 | `10.0.0.0/24` | every address in the network | every address, up to 65,536 per scan |
@@ -175,6 +247,8 @@ Set the scope with flags, a file, or both:
 -u app.example.com      # that one host; a URL works too
 -x admin.example.com    # keep a pattern out
 --scope scope.txt       # patterns from a file
+--program h1:acme       # a HackerOne program's in-scope and out-of-scope assets
+--rules acme.rules      # rules of engagement; may add exclusions, never inclusions
 ```
 
 ```text
@@ -304,6 +378,8 @@ reconic_output/
         ├── subdomains.txt  resolved.txt  alive.txt  endpoints.txt
         ├── findings.jsonl
         ├── scope_receipt.jsonl     every connection the firewall allowed or blocked
+        ├── receipt.md              one-page summary of the above, for a report
+        ├── program_scope.json      the imported program scope (with --program)
         └── raw/                    each tool's input, command line, stdout and stderr
 ```
 
@@ -312,7 +388,7 @@ Progress goes to stderr and the path of `results.json` to stdout. Exit codes: `0
 ## Status
 
 > [!NOTE]
-> Reconic 2 is an alpha. It has run end to end against a real single-host scope, and enumeration and DNS resolution against a real wildcard domain. A full active scan of a large wildcard scope has not been done yet, and the scope firewall has been tested with the real tools against a local server only. Please report rough edges.
+> Reconic 2 is an alpha. It has run end to end against a real single-host scope, and enumeration and DNS resolution against a real wildcard domain. A full active scan of a large wildcard scope has not been done yet, and the scope firewall has been tested with the real tools against a local server only. A full active scan with a rules file has been run against a local DVWA: about 11,800 connections, all to the one in-scope host, with forbidden paths and callbacks to other hosts refused. Chaining the firewall to Tor has been tested through a real Tor client. The tests pass on Python 3.9, 3.10 and 3.14, including Ctrl-C. Program import has been tested against a local stand-in for the HackerOne API, not the live one. Please report rough edges.
 
 ## Development
 

@@ -4,6 +4,10 @@ The tools that contact targets are pointed at it, so a redirect, a template or
 a crawled link cannot make them reach a host outside the scope. Every
 connection attempt, allowed or blocked, is appended to the run's scope receipt.
 
+Plain HTTP requests are visible to it in full, so for those it also refuses
+forbidden paths and checks that the required headers are present. HTTPS is
+tunnelled and stays opaque: there only the host is checked.
+
 It speaks both HTTP (CONNECT and plain requests) and SOCKS5 on one port, and
 can chain to an upstream HTTP or SOCKS5 proxy.
 """
@@ -15,13 +19,14 @@ import ipaddress
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import unquote, urlsplit
 
 from .scope import Scope
 
 RECEIPT_NAME = 'scope_receipt.jsonl'
 _TIMEOUT = 30
+_UPSTREAM_TIMEOUT = 90  # a connect through Tor can take longer than 30s while it builds a circuit
 _HEAD_LIMIT = 1 << 20
 _HOP_HEADERS = ('proxy-connection', 'proxy-authorization', 'connection', 'keep-alive')
 # Requests a tool makes on its own account whenever it is given a proxy. They are
@@ -124,15 +129,20 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 
 
 class ScopeFirewall:
-    def __init__(self, scope: Scope, receipt: Path, upstream: Optional[str] = None):
+    def __init__(self, scope: Scope, receipt: Path, upstream: Optional[str] = None,
+                 forbids: Optional[Callable[[str], bool]] = None, required_headers: Sequence[str] = ()):
         self.scope = scope
+        self.forbids = forbids or (lambda path: False)
+        self.required_headers = [name.lower() for name in required_headers]
         self.receipt = Path(receipt)
         self.upstream = Upstream(upstream) if upstream else None
         self.stage = ''             # set by the pipeline, so each record names the stage that caused it
         self.connections = 0
         self.blocked = 0
-        self._allowed_hosts: Dict[str, int] = {}
+        self._allowed_hosts: Dict[str, dict] = {}
         self._blocked_hosts: Dict[str, dict] = {}
+        self._blocked_paths: Dict[str, dict] = {}
+        self.header_checks = {'checked': 0, 'missing': 0}
         self._tasks: Set[asyncio.Task] = set()
         self._server: Optional[asyncio.AbstractServer] = None
         self._log = None
@@ -161,27 +171,43 @@ class ScopeFirewall:
             'receipt': RECEIPT_NAME,
             'connections': self.connections,
             'hosts': sorted(self._allowed_hosts),
-            'blocked': [{'host': host, **entry, 'stages': sorted(entry['stages'])}
-                        for host, entry in sorted(self._blocked_hosts.items())],
+            'contacted': _entries('host', self._allowed_hosts),
+            'blocked': _entries('host', self._blocked_hosts),
+            'forbidden': _entries('url', self._blocked_paths),
+            'header_checks': dict(self.header_checks, required=list(self.required_headers)),
         }
 
     # -- decisions --------------------------------------------------------
 
-    def _check(self, host: str, port: int, via: str) -> bool:
-        """Decide whether host may be contacted, and write the decision to the receipt."""
+    def _check(self, host: str, port: int, via: str, path: Optional[str] = None,
+               headers: Sequence[str] = ()) -> bool:
+        """Decide whether host (and, for plain HTTP, path) may be contacted, and write it to the receipt."""
         allowed = self.scope.allows(f"[{host}]" if ':' in host else host)
         record = {'time': datetime.now(timezone.utc).isoformat(timespec='milliseconds'), 'stage': self.stage,
                   'action': 'allowed' if allowed else 'blocked', 'host': host, 'port': port, 'via': via}
-        if allowed:
+        if path is not None:
+            record['path'] = path
+        if allowed and path is not None and self.forbids(path):
+            allowed = False
+            record.update(action='blocked', reason='forbidden path')
+            self.blocked += 1
+            authority = f"{host}:{port}" if port != 80 else host
+            _count(self._blocked_paths, f"http://{authority}{path}", self.stage)
+        elif allowed:
             self.connections += 1
-            self._allowed_hosts[host] = self._allowed_hosts.get(host, 0) + 1
+            _count(self._allowed_hosts, host, self.stage, 'connections')
+            if path is not None and self.required_headers:
+                present = {line.split(':', 1)[0].strip().lower() for line in headers}
+                missing = [name for name in self.required_headers if name not in present]
+                self.header_checks['checked'] += 1
+                if missing:
+                    self.header_checks['missing'] += 1
+                record['required_headers'] = 'missing: ' + ', '.join(missing) if missing else 'present'
         elif host in _TOOL_PROBES:
             record['note'] = _TOOL_PROBES[host]
         else:
             self.blocked += 1
-            entry = self._blocked_hosts.setdefault(host, {'attempts': 0, 'stages': set()})
-            entry['attempts'] += 1
-            entry['stages'].add(self.stage)
+            _count(self._blocked_hosts, host, self.stage)
         self._log.write(json.dumps(record) + '\n')
         self._log.flush()
         return allowed
@@ -194,7 +220,7 @@ class ScopeFirewall:
         stream = await asyncio.wait_for(self._dial_upstream(), _TIMEOUT)
         try:
             connect = _socks5_connect if upstream.socks else _http_connect
-            await asyncio.wait_for(connect(stream, upstream, host, port), _TIMEOUT)
+            await asyncio.wait_for(connect(stream, upstream, host, port), _UPSTREAM_TIMEOUT)
         except BaseException:
             stream[1].close()
             raise
@@ -286,7 +312,7 @@ class ScopeFirewall:
         host, port = parts.hostname, parts.port or 80
         # A blocked or unreachable host gets no answer at all: an error page from here
         # would be read by the tool as the target's own response.
-        if not self._check(host, port, 'http'):
+        if not self._check(host, port, 'http', parts.path or '/', headers):
             return None
         upstream = self.upstream
         try:
@@ -301,6 +327,16 @@ class ScopeFirewall:
             return None
         stream[1].write(_request_head(method, target, version, headers, extra))
         return stream
+
+
+def _count(table: Dict[str, dict], key: str, stage: str, counter: str = 'attempts') -> None:
+    entry = table.setdefault(key, {counter: 0, 'stages': set()})
+    entry[counter] += 1
+    entry['stages'].add(stage)
+
+
+def _entries(name: str, table: Dict[str, dict]) -> List[dict]:
+    return [{name: key, **entry, 'stages': sorted(entry['stages'])} for key, entry in sorted(table.items())]
 
 
 def _request_head(method: str, target: str, version: str, headers: Sequence[str], extra: List[str]) -> bytes:

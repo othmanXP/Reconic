@@ -127,6 +127,7 @@ class Runner:
         self.options = options or RunOptions()
         self.search_path = list(search_path) if search_path is not None else default_search_path()
         self.firewall = None  # a running ScopeFirewall; set by the pipeline for the active stages
+        self.invocations: List[dict] = []  # how each tool was configured, for the run's receipt
         self._resolved: Dict[str, Optional[ResolvedTool]] = {}
 
     async def resolve(self, spec: ToolSpec) -> Optional[ResolvedTool]:
@@ -188,7 +189,9 @@ class Runner:
         shown = list(argv)
         options = self.options
         proxy = options.proxy
+        route = 'your proxy' if proxy else 'direct'
         if spec.firewalled and self.firewall:
+            route = 'scope firewall' + (' -> your proxy' if options.proxy else '')
             # With a proxy of the user's the firewall chains to it. The tool is then given the
             # SOCKS5 side, which also carries its non-HTTP traffic, so nothing connects directly.
             proxy = self.firewall.url('socks5' if options.proxy else 'http')
@@ -204,6 +207,12 @@ class Runner:
         if spec.rate_flag and options.rate_limit:
             argv += [spec.rate_flag, str(options.rate_limit)]
             shown += [spec.rate_flag, str(options.rate_limit)]
+        self.invocations.append({
+            'stage': stage, 'tool': spec.name, 'route': route,
+            'rate_limit': options.rate_limit if spec.rate_flag else None,
+            'headers': [h.split(':', 1)[0].strip() for h in options.headers] if spec.header_flag else [],
+            'cmd': f"raw/{stage}.{spec.name}.cmd",
+        })
 
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         base = f"{stage}.{spec.name}"

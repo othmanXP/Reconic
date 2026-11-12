@@ -1,7 +1,8 @@
 """Recon pipeline: enumerate -> resolve -> probe -> crawl -> takeover -> nuclei.
 
 Scope is applied to the input and the output of every stage, and the tools
-that contact targets run behind the scope firewall. Each run writes into its
+that contact targets run behind the scope firewall. Forbidden paths from the
+rules of engagement are kept out of what tools are given and what they crawl. Each run writes into its
 own directory, so results can never be mixed with an earlier run.
 """
 from __future__ import annotations
@@ -16,7 +17,10 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import __version__
+from . import program as programs
+from . import receipt
 from .firewall import RECEIPT_NAME, ScopeFirewall
+from .rules import Rules
 from .runner import Runner, RunOptions, ToolError, ToolSpec
 from .scope import Scope, is_address
 
@@ -65,6 +69,8 @@ class ScanConfig:
     severity: str = 'critical,high,medium'
     templates: Optional[Path] = None
     stage_timeout: float = 3600.0
+    rules: Rules = field(default_factory=Rules)  # already merged into scope and options by the caller
+    program: Optional[dict] = None               # an imported program scope, cached in the run directory
 
 
 @dataclass
@@ -76,6 +82,7 @@ class StageReport:
     count: int = 0
     out_of_scope: int = 0
     blocked: int = 0            # out-of-scope connections the firewall refused during the stage
+    forbidden: int = 0          # targets left out because their path is forbidden by the rules
 
 
 def _json_lines(lines: Sequence[str]) -> List[dict]:
@@ -230,7 +237,8 @@ class Pipeline:
         self.on_start('probe', f"httpx on {len(hosts)} host(s)")
         report = StageReport('probe')
         # No redirect following: a redirect can lead off-scope. The Location header is recorded instead.
-        args = ['-l', self._input_file('probe', hosts), '-j', '-sc', '-title', '-td', '-location',
+        targets = [target for host in hosts for target in self.config.scope.probe_targets(host)]
+        args = ['-l', self._input_file('probe', targets), '-j', '-sc', '-title', '-td', '-location',
                 '-t', str(self.config.threads), '-timeout', '10']
         alive, seen = [], set()
         for item in _json_lines(await self._tool(report, HTTPX, args)):
@@ -254,10 +262,20 @@ class Pipeline:
         self._finish(report)
         return alive
 
+    def _allowed_urls(self, report: StageReport, urls: List[str]) -> List[str]:
+        kept = [url for url in urls if not self.config.rules.forbids(url)]
+        report.forbidden = len(urls) - len(kept)
+        return kept
+
     async def _crawl(self, urls: List[str]) -> List[str]:
         cfg = self.config
-        self.on_start('crawl', f"katana on {len(urls)} URL(s), depth {cfg.depth}")
         report = StageReport('crawl')
+        urls = self._allowed_urls(report, urls)
+        if not urls:
+            report.status, report.detail = 'skipped', 'every URL has a forbidden path'
+            self._finish(report)
+            return []
+        self.on_start('crawl', f"katana on {len(urls)} URL(s), depth {cfg.depth}")
         args = ['-list', self._input_file('crawl', urls), '-d', str(cfg.depth), '-jc',
                 '-ct', f"{cfg.crawl_minutes}m"]
         if cfg.depth >= 3:
@@ -272,6 +290,8 @@ class Pipeline:
                 args += ['-cs', regex]
             for regex in regexes[1]:
                 args += ['-cos', regex]
+        for regex in cfg.rules.url_regexes():
+            args += ['-cos', regex]
         kept, report.out_of_scope = cfg.scope.split(await self._tool(report, KATANA, args))
         endpoints = sorted(kept)
         report.count = len(endpoints)
@@ -279,8 +299,13 @@ class Pipeline:
         return endpoints
 
     async def _nuclei(self, stage: str, targets: List[str], extra: Sequence[str]) -> List[dict]:
-        self.on_start(stage, f"nuclei on {len(targets)} target(s)")
         report = StageReport(stage)
+        targets = self._allowed_urls(report, targets)
+        if not targets:
+            report.status, report.detail = 'skipped', 'every target has a forbidden path'
+            self._finish(report)
+            return []
+        self.on_start(stage, f"nuclei on {len(targets)} target(s)")
         tool = await self.runner.resolve(NUCLEI)
         modern = tool is None or tool.version[0] >= 3
         args = ['-l', self._input_file(stage, targets), '-jsonl' if modern else '-json', *extra]
@@ -370,10 +395,14 @@ class Pipeline:
         cfg = self.config
         started = datetime.now(timezone.utc)
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        if cfg.program:
+            (self.run_dir / programs.CACHE_NAME).write_text(json.dumps(cfg.program, indent=2) + '\n', encoding='utf-8')
         firewall = {'enabled': False}
         try:
             if cfg.firewall and not (cfg.passive or cfg.dns_only):
-                async with ScopeFirewall(cfg.scope, self.run_dir / RECEIPT_NAME, cfg.options.proxy) as running:
+                async with ScopeFirewall(cfg.scope, self.run_dir / RECEIPT_NAME, cfg.options.proxy,
+                                         forbids=cfg.rules.forbids,
+                                         required_headers=cfg.rules.header_names()) as running:
                     self.runner.firewall = running
                     try:
                         await self._stages()
@@ -403,6 +432,8 @@ class Pipeline:
             'finished': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'interrupted': self.interrupted,
             'scope': cfg.scope.to_dict(),
+            'program': programs.summary(cfg.program),
+            'rules': cfg.rules.to_dict(),
             'options': {
                 'passive': cfg.passive,
                 'proxy': bool(cfg.options.proxy),
@@ -411,6 +442,7 @@ class Pipeline:
             },
             'firewall': firewall,
             'tools': self.runner.resolved(),
+            'invocations': self.runner.invocations,
             'stages': [asdict(report) for report in self.reports],
             'subdomains': self.hosts,
             'resolved': self.resolved,
@@ -431,6 +463,7 @@ class Pipeline:
         (out / 'endpoints.txt').write_text(''.join(f"{e}\n" for e in results['endpoints']), encoding='utf-8')
         (out / 'findings.jsonl').write_text(
             ''.join(json.dumps(f) + '\n' for f in results['findings']), encoding='utf-8')
+        (out / receipt.RECEIPT_MD).write_text(receipt.render(results, out), encoding='utf-8')
 
 
 def failed_stages(results: dict) -> List[Tuple[str, str]]:

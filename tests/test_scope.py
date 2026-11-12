@@ -109,3 +109,16 @@ def test_wildcards_are_enumerated_from_their_fixed_suffix():
         scope = Scope([pattern])
         assert scope.enumeration_roots() == [] and scope.unseeded() == [pattern]
     assert Scope(['*.example.com', '10.0.0.0/30', 'a.example.com']).unseeded() == []
+
+
+def test_a_port_says_where_to_probe_but_does_not_narrow_the_scope():
+    scope = Scope(['app.example.com:8443', 'app.example.com:9000', 'https://api.example.com:4280/x',
+                   'www.example.com', '*.example.com:8080'])
+    assert scope.include == ['app.example.com', 'api.example.com', 'www.example.com', '*.example.com']
+    assert scope.probe_targets('app.example.com') == ['app.example.com:8443', 'app.example.com:9000']
+    assert scope.probe_targets('api.example.com') == ['api.example.com:4280']
+    assert scope.probe_targets('www.example.com') == ['www.example.com']
+    assert scope.probe_targets('dev.example.com') == ['dev.example.com']  # found by enumeration
+    assert scope.allows('app.example.com:22')  # the scope is per host
+    assert scope.to_dict()['ports'] == {'app.example.com': [8443, 9000], 'api.example.com': [4280]}
+    assert 'ports' not in Scope(['www.example.com']).to_dict()

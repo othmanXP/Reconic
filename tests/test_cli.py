@@ -113,3 +113,81 @@ def test_ctrl_c_saves_the_run_and_records_it(fake_tools, tmp_path, capsys):
     assert main(['runs', '-o', str(out), '--json']) == 0
     recorded = json.loads(capsys.readouterr().out)
     assert len(recorded) == 1 and recorded[0]['stages']['crawl']['status'] == 'interrupted'
+
+
+@pytest.fixture
+def program_env(fake_tools, tmp_path, monkeypatch):
+    """Fake tools on PATH, a config directory, HackerOne credentials and a local stand-in for its API."""
+    from tests.test_program import FakeHackerOne, asset
+    monkeypatch.setenv('PATH', fake_tools.dir)
+    monkeypatch.setenv('GOPATH', str(tmp_path / 'go'))
+    monkeypatch.delenv('GOBIN', raising=False)
+    monkeypatch.delenv('RECONIC_NOTIFY', raising=False)
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'config'))
+    monkeypatch.setenv('HACKERONE_API_USERNAME', 'hacker')
+    monkeypatch.setenv('HACKERONE_API_TOKEN', 's3cret')
+    fake = FakeHackerOne([asset('app.example.com'), asset('api.example.com, admin.example.com'),
+                          asset('admin.example.com', in_scope=False),
+                          asset('com.example.app', 'GOOGLE_PLAY_APP_ID')])
+    with fake:
+        monkeypatch.setattr('reconic.program.H1_API', fake.api)
+        yield fake
+
+
+def test_program_scan_end_to_end(program_env, fake_tools, tmp_path, capsys):
+    rules = tmp_path / 'config' / 'reconic' / 'programs' / 'h1-acme.rules'
+    rules.parent.mkdir(parents=True)
+    rules.write_text("rate-limit: 4\nheader: X-Bug-Bounty: me\nexclude: api.example.com\n")
+    code = main(['--no-banner', 'scan', '--program', 'h1:acme', '--rate-limit', '50', '-y',
+                 '-o', str(tmp_path / 'out')])
+    err = capsys.readouterr().err
+    assert code == 0, err
+    assert 'h1:acme: 3 in scope, 1 out of scope' in err
+    assert 'com.example.app: skipped: not a web asset' in err
+    assert 'Rules       4 req/s · header X-Bug-Bounty' in err
+
+    run_dir = next((tmp_path / 'out' / 'acme').iterdir())
+    results = json.loads((run_dir / 'results.json').read_text())
+    assert results['scope'] == {'include': ['app.example.com', 'api.example.com', 'admin.example.com'],
+                                'exclude': ['admin.example.com', 'api.example.com']}
+    assert results['subdomains'] == ['app.example.com']
+    assert results['options']['rate_limit'] == 4  # the stricter of the flag and the rule
+    assert (run_dir / 'program_scope.json').is_file() and (run_dir / 'receipt.md').is_file()
+    assert all('-rl' in call['args'] and call['args'][call['args'].index('-rl') + 1] == '4'
+               for call in fake_tools.calls())
+
+
+def test_program_without_rules_gets_a_template(program_env, tmp_path, capsys):
+    code = main(['--no-banner', 'scan', '--program', 'h1:acme', '--passive', '-o', str(tmp_path / 'out')])
+    assert code == 0
+    template = tmp_path / 'config' / 'reconic' / 'programs' / 'h1-acme.rules'
+    assert template.is_file()
+    assert f"none yet: fill in {template}" in capsys.readouterr().err
+
+
+def test_scan_outside_the_allowed_hours_does_not_start(program_env, fake_tools, tmp_path, capsys):
+    hour = time.gmtime().tm_hour
+    rules = tmp_path / 'acme.rules'
+    rules.write_text(f"hours: {(hour + 2) % 24:02d}:00-{(hour + 3) % 24:02d}:00\n")
+    code = main(['--no-banner', 'scan', '--program', 'h1:acme', '--rules', str(rules), '-y',
+                 '-o', str(tmp_path / 'out')])
+    assert code == 2
+    assert 'not starting: the program allows scans from' in capsys.readouterr().err
+    assert fake_tools.calls() == [] and not (tmp_path / 'out').exists()
+    # passive runs send nothing to the target, so the window does not apply to them
+    assert main(['--no-banner', 'scan', '--program', 'h1:acme', '--rules', str(rules), '--passive',
+                 '-o', str(tmp_path / 'out')]) == 0
+
+
+def test_bad_rules_file_stops_the_scan(program_env, tmp_path, capsys):
+    rules = tmp_path / 'acme.rules'
+    rules.write_text("forbidd: /logout\n")
+    assert main(['--no-banner', 'scan', '-u', 'app.example.com', '--rules', str(rules), '-y']) == 2
+    assert 'acme.rules:1: unknown rule' in capsys.readouterr().err
+
+
+def test_host_flag_keeps_its_port_for_probing():
+    scope = build_scope(parse('-u', '127.0.0.1:4280', '-u', 'http://app.example.com:8080/login'))
+    assert scope.include == ['127.0.0.1', 'app.example.com']
+    assert scope.probe_targets('127.0.0.1') == ['127.0.0.1:4280']
+    assert scope.probe_targets('app.example.com') == ['app.example.com:8080']

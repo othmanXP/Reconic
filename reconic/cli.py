@@ -11,14 +11,17 @@ import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import __version__
 from .banner import print_banner
-from .firewall import RECEIPT_NAME, Upstream
+from .firewall import Upstream
 from .notify import (NotifyError, build_message, check_url, describe, first_run_message, payload_for,
                      send)
 from .pipeline import INCOMPLETE, TOOLS, Pipeline, ScanConfig, StageReport, failed_stages
+from .program import ProgramError, import_program, parse_program
+from .receipt import RECEIPT_MD
+from .rules import Rules, load_for_program
 from .runner import Runner, RunOptions
 from .scope import Scope, host_of
 from .store import DB_NAME, KINDS, Store, StoreError, highlights
@@ -77,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="scope file: one pattern per line, '!' prefix excludes, '#' comments")
     target.add_argument('-x', '--exclude', action='append', default=[], metavar='PATTERN',
                         help='pattern to keep out of scope, e.g. admin.example.com or *.corp.example.com')
+    target.add_argument('--program', metavar='h1:HANDLE',
+                        help='import the scope of a HackerOne program (needs HACKERONE_API_USERNAME and '
+                             'HACKERONE_API_TOKEN) and apply its rules file')
+    target.add_argument('--rules', type=Path, metavar='FILE',
+                        help='rules of engagement file (default for --program: '
+                             '~/.config/reconic/programs/h1-HANDLE.rules)')
 
     stages = scan.add_argument_group('stages')
     stages.add_argument('--passive', action='store_true',
@@ -127,9 +136,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_scope(args: argparse.Namespace) -> Scope:
-    include: List[str] = []
-    exclude: List[str] = list(args.exclude)
+def build_scope(args: argparse.Namespace, program: Optional[dict] = None, rules: Optional[Rules] = None) -> Scope:
+    include: List[str] = list(program['include']) if program else []
+    exclude: List[str] = list(args.exclude) + (program['exclude'] if program else [])
+    if rules:
+        exclude += rules.exclude
     for domain in args.domain:
         host = host_of(domain)
         if host is None:
@@ -139,7 +150,8 @@ def build_scope(args: argparse.Namespace) -> Scope:
         host = host_of(target)
         if host is None:
             raise ValueError(f"not a valid host or URL: {target!r}")
-        include.append(host)
+        port = urlsplit(target if '://' in target else '//' + target).port
+        include.append(f"{host}:{port}" if port and ':' not in host else host)
     if args.scope:
         file_include, file_exclude = Scope.parse_file(args.scope)
         include += file_include
@@ -151,12 +163,14 @@ def build_scope(args: argparse.Namespace) -> Scope:
     return scope
 
 
-def build_options(args: argparse.Namespace) -> RunOptions:
+def build_options(args: argparse.Namespace, rules: Optional[Rules] = None) -> RunOptions:
     if args.proxy and args.tor:
         raise ValueError("use either --proxy or --tor, not both")
+    rules = rules or Rules()
     headers = list(args.header)
     if args.cookie:
         headers.append(f"Cookie: {args.cookie}")
+    headers += [header for header in rules.headers if header not in headers]
     for header in headers:
         if ':' not in header or not header.split(':', 1)[0].strip():
             raise ValueError(f'header must look like "Name: value": {header!r}')
@@ -165,7 +179,18 @@ def build_options(args: argparse.Namespace) -> RunOptions:
     proxy = TOR_PROXY if args.tor else args.proxy
     if proxy and not args.no_firewall:
         Upstream(proxy)  # fail now, not mid-scan, on a proxy the firewall cannot chain to
-    return RunOptions(proxy=proxy, headers=headers, rate_limit=args.rate_limit)
+    limits = [limit for limit in (args.rate_limit, rules.rate_limit) if limit]
+    return RunOptions(proxy=proxy, headers=headers, rate_limit=min(limits) if limits else None)
+
+
+def load_rules(args: argparse.Namespace) -> Tuple[Rules, Optional[Path]]:
+    """The rules to apply, and the path of a template if one was just written for a program."""
+    if args.rules:
+        return Rules.load(args.rules), None
+    if args.program:
+        platform, handle = parse_program(args.program)
+        return load_for_program(platform, handle, f"{platform}:{handle}")
+    return Rules(), None
 
 
 def select_hosts(text: str, alive: List[dict]) -> List[dict]:
@@ -210,6 +235,8 @@ def _stage_end(report: StageReport) -> None:
         parts.append(f"{report.out_of_scope} out of scope dropped")
     if report.blocked:
         parts.append(f"{report.blocked} blocked by firewall")
+    if report.forbidden:
+        parts.append(f"{report.forbidden} forbidden path(s) left out")
     parts.append(f"{report.duration:.1f}s")
     if report.status == 'ok':
         _say(f"  {_paint('✓', 'green')} {report.name:<10} {' · '.join(parts)}")
@@ -239,11 +266,40 @@ async def _doctor() -> int:
     return 1 if missing else 0
 
 
+def _show_program(program: dict) -> None:
+    _say(f"  Program     {program['id']}: {len(program['include'])} in scope, "
+         f"{len(program['exclude'])} out of scope · cached as {program['cache']}")
+    for note in program['notes']:
+        line = f"    {'!' if note['warn'] else '·'} {note['asset']}: {note['note']}"
+        _say(_paint(line, 'yellow' if note['warn'] else 'dim'))
+
+
+def _show_rules(rules: Rules, template: Optional[Path]) -> None:
+    if template:
+        _say(_paint(f"  Rules       none yet: fill in {template} from the program policy", 'yellow'))
+        return
+    if rules.empty:
+        return
+    parts = []
+    if rules.rate_limit:
+        parts.append(f"{rules.rate_limit} req/s")
+    if rules.headers:
+        parts.append('header ' + ', '.join(rules.header_names()))
+    if rules.forbid:
+        parts.append('forbid ' + ' '.join(rules.forbid))
+    if rules.hours:
+        parts.append('hours ' + rules.describe_hours())
+    _say(f"  Rules       {' · '.join(parts) or 'exclusions only'}  {_paint(rules.source or '', 'dim')}")
+
+
 def _confirm(scope: Scope, config: ScanConfig, yes: bool) -> bool:
     _say("  Scope")
     unseeded = scope.unseeded()
+    ports = scope.ports()
     for pattern in scope.include:
         note = _paint("  filter only: names no host or domain to start from", 'yellow') if pattern in unseeded else ''
+        if pattern in ports:
+            note = _paint(f"  probed on port {', '.join(map(str, ports[pattern]))}", 'dim')
         _say(f"    {_paint('+', 'green')} {pattern}{note}")
     for pattern in scope.exclude:
         _say(f"    {_paint('-', 'red')} {pattern}")
@@ -283,7 +339,10 @@ def _summary(results: dict, run_dir: Path) -> None:
         for entry in firewall['blocked']:
             _say(f"    {_paint('blocked', 'yellow')}  {entry['host']}  "
                  f"{_paint(str(entry['attempts']) + 'x in ' + ', '.join(entry['stages']), 'dim')}")
-        _say(_paint(f"    receipt: {run_dir / RECEIPT_NAME}", 'dim'))
+        for entry in firewall.get('forbidden') or []:
+            _say(f"    {_paint('forbidden', 'yellow')}  {entry['url']}  "
+                 f"{_paint(str(entry['attempts']) + 'x in ' + ', '.join(entry['stages']), 'dim')}")
+        _say(_paint(f"    receipt: {run_dir / RECEIPT_MD}", 'dim'))
     problems = failed_stages(results)
     if problems:
         _say()
@@ -450,22 +509,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             return asyncio.run(_doctor())
 
         try:
-            scope = build_scope(args)
-            options = build_options(args)
+            rules, template = load_rules(args)
+            program = import_program(args.program) if args.program else None
+            scope = build_scope(args, program, rules)
+            options = build_options(args, rules)
             webhooks = [check_url(url) for url in
                         args.notify + os.environ.get('RECONIC_NOTIFY', '').replace(',', ' ').split()]
-        except (ValueError, OSError) as error:
+        except (ValueError, OSError, ProgramError) as error:
             _say(_paint(f"  error: {error}", 'red'))
             return 2
 
         config = ScanConfig(
-            scope=scope, name=args.name, output_dir=args.output_dir, options=options,
+            scope=scope, name=args.name or (program and program['handle']), output_dir=args.output_dir,
+            options=options, rules=rules, program=program,
             passive=args.passive, dns_only=args.dns_only, resolve=not args.no_resolve, crawl=not args.no_crawl, takeover=not args.no_takeover,
             nuclei=not args.no_nuclei, firewall=not args.no_firewall, all_sources=args.all_sources,
             threads=args.threads,
             depth=args.depth, headless=args.headless, crawl_minutes=args.crawl_minutes,
             severity=args.severity, templates=args.templates, stage_timeout=args.stage_timeout * 60,
         )
+        if program:
+            _show_program(program)
+        _show_rules(rules, template)
+        active = not (config.passive or config.dns_only)
+        problem = rules.window_problem() if active else None
+        if problem:
+            _say(_paint(f"  error: not starting: {problem}", 'red'))
+            return 2
         if not _confirm(scope, config, args.yes):
             _say("  Scan cancelled.")
             return 2

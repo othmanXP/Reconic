@@ -278,3 +278,70 @@ def test_wildcard_inside_a_label_enumerates_its_domain(fake_tools, tmp_path, mon
     assert (pipeline.run_dir / 'raw' / 'enumerate.input.txt').read_text().split() == ['example.com']
     assert results['subdomains'] == ['api-eu.example.com', 'api-v2.example.com']
     assert stage(results, 'enumerate')['out_of_scope'] == 2  # www and the foreign host
+
+
+def test_rules_reach_every_tool_and_the_receipt(fake_tools, tmp_path):
+    from reconic.rules import Rules
+    rules = Rules.parse("rate-limit: 7\nheader: X-Bug-Bounty: me\nforbid: /logout\n", 'acme.rules')
+    options = RunOptions(headers=['X-Bug-Bounty: me'], rate_limit=7)
+    pipeline, results = scan(fake_tools, tmp_path, domain_scope(), options=options, rules=rules)
+
+    for call in fake_tools.calls():
+        args = call['args']
+        assert args[args.index('-rl') + 1] == '7'
+        if call['tool'] in ('httpx', 'katana', 'nuclei'):
+            assert args[args.index('-H') + 1] == 'X-Bug-Bounty: me'
+    katana = next(call['args'] for call in fake_tools.calls() if call['tool'] == 'katana')
+    assert katana.count('-cos') == 2 and any('logout' in arg for arg in katana)
+
+    assert results['rules']['forbid'] == ['/logout'] and results['rules']['headers'] == ['X-Bug-Bounty']
+    assert [(i['stage'], i['tool'], i['route']) for i in results['invocations']] == [
+        ('enumerate', 'subfinder', 'direct'), ('resolve', 'dnsx', 'direct'),
+        ('probe', 'httpx', 'scope firewall'), ('crawl', 'katana', 'scope firewall'),
+        ('takeover', 'nuclei', 'scope firewall'), ('nuclei', 'nuclei', 'scope firewall')]
+
+    page = (pipeline.run_dir / 'receipt.md').read_text()
+    assert page.startswith('# Scope receipt: example.com')
+    assert 'at most 7 requests/s' in page and '`/logout`' in page
+    assert 'were given to every tool that contacts the target' in page
+    assert 'Nothing was blocked' in page and 'sha256 `' in page
+
+
+def test_forbidden_targets_are_never_handed_to_a_tool(fake_tools, tmp_path):
+    from reconic.rules import Rules
+    rules = Rules.parse("forbid: /\n")  # every URL: nothing may be crawled or scanned
+    pipeline, results = scan(fake_tools, tmp_path, domain_scope(), rules=rules)
+    assert stage(results, 'crawl')['status'] == 'skipped' and stage(results, 'crawl')['forbidden'] == 3
+    assert stage(results, 'nuclei')['status'] == 'skipped'
+    assert stage(results, 'takeover')['status'] == 'ok'  # bare hostnames have no path
+    assert 'katana' not in [call['tool'] for call in fake_tools.calls()]
+
+
+def test_blocked_hosts_and_missing_headers_show_on_the_receipt(fake_tools, tmp_path, monkeypatch):
+    from reconic.rules import Rules
+    rules = Rules.parse("header: X-Bug-Bounty: me\n")
+    monkeypatch.setenv('FAKE_FETCH', 'http://localhost:9/out-of-scope')
+    pipeline, results = scan(fake_tools, tmp_path, Scope(['127.0.0.1']), rules=rules)  # header never configured
+    page = (pipeline.run_dir / 'receipt.md').read_text()
+    assert '| `localhost` | out of scope | 1 | crawl |' in page
+    assert 'were NOT given to: httpx, katana, nuclei' in page
+
+
+def test_imported_program_is_cached_and_recorded(fake_tools, tmp_path):
+    program = {'platform': 'hackerone', 'handle': 'acme', 'id': 'h1:acme', 'fetched': '2026-11-12T10:00:00+00:00',
+               'cache': 'program_scope.json', 'include': ['app.example.com'], 'exclude': [],
+               'notes': [{'asset': 'com.acme', 'type': 'GOOGLE_PLAY_APP_ID', 'in_scope': True,
+                          'note': 'skipped: not a web asset (GOOGLE_PLAY_APP_ID)', 'warn': False}],
+               'assets': [{'asset_identifier': 'app.example.com'}, {'asset_identifier': 'com.acme'}]}
+    pipeline, results = scan(fake_tools, tmp_path, Scope(['app.example.com']), program=program, name='acme')
+    cached = json.loads((pipeline.run_dir / 'program_scope.json').read_text())
+    assert cached == program
+    assert results['program']['id'] == 'h1:acme' and 'assets' not in results['program']
+    assert pipeline.run_dir.parent.name == 'acme'
+    assert '**Program:** h1:acme' in (pipeline.run_dir / 'receipt.md').read_text()
+
+
+def test_a_host_with_a_port_is_probed_on_that_port(fake_tools, tmp_path):
+    pipeline, results = scan(fake_tools, tmp_path, Scope(['127.0.0.1:4280']))
+    assert (pipeline.run_dir / 'raw' / 'probe.input.txt').read_text().split() == ['127.0.0.1:4280']
+    assert results['subdomains'] == ['127.0.0.1'] and results['scope']['ports'] == {'127.0.0.1': [4280]}

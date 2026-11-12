@@ -172,3 +172,33 @@ def test_upstream_proxy_urls():
     assert Upstream('socks5://127.0.0.1').port == 1080 and Upstream('socks5h://127.0.0.1:9050').socks
     with pytest.raises(ValueError, match='--no-firewall'):
         Upstream('socks4://127.0.0.1:1080')
+
+
+def test_forbidden_path_on_plain_http_is_refused_and_headers_are_checked(tmp_path):
+    from reconic.rules import Rules
+    rules = Rules.parse("forbid: /logout\nheader: X-Bug-Bounty: me\n")
+
+    async def scenario():
+        async with Target() as target, ScopeFirewall(SCOPE, tmp_path / 'receipt', forbids=rules.forbids,
+                                                     required_headers=rules.header_names()) as firewall:
+            firewall.stage = 'crawl'
+            base = f"http://127.0.0.1:{target.port}"
+            ok = await talk(firewall.port, f"GET {base}/home HTTP/1.1\r\nX-Bug-Bounty: me\r\n\r\n".encode())
+            bare = await talk(firewall.port, f"GET {base}/about HTTP/1.1\r\n\r\n".encode())
+            refused = await talk(firewall.port, f"GET {base}/LogOut?next=/ HTTP/1.1\r\nX-Bug-Bounty: me\r\n\r\n".encode())
+            return (ok, bare, refused), target.requests, firewall.summary(), firewall.blocked
+
+    (ok, bare, refused), requests, summary, blocked = asyncio.run(scenario())
+    assert ok.endswith(b'ok') and bare.endswith(b'ok') and refused == b''
+    assert [r.split(' ')[1] for r in requests] == ['/home', '/about']  # /LogOut never reached the target
+    assert blocked == 1 and summary['blocked'] == []
+    assert [(e['url'].split('/', 3)[3], e['attempts'], e['stages']) for e in summary['forbidden']] == [
+        ('LogOut', 1, ['crawl'])]
+    assert summary['header_checks'] == {'checked': 2, 'missing': 1, 'required': ['x-bug-bounty']}
+    assert summary['contacted'] == [{'host': '127.0.0.1', 'connections': 2, 'stages': ['crawl']}]
+    records = receipt(tmp_path / 'receipt')
+    assert [(r['action'], r['path'], r.get('reason'), r.get('required_headers')) for r in records] == [
+        ('allowed', '/home', None, 'present'),
+        ('allowed', '/about', None, 'missing: x-bug-bounty'),
+        ('blocked', '/LogOut', 'forbidden path', None),
+    ]

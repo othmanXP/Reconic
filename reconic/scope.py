@@ -5,7 +5,9 @@ Patterns
     *.example.com       any subdomain of example.com, at any depth (not the apex)
     api-*.example.com   glob inside a label
     10.0.0.0/24         every address in the network
-Exclusions always win over inclusions.
+Exclusions always win over inclusions. A port on an exact host
+('app.example.com:8443') does not narrow the scope, which is per host; it says
+where that host is probed.
 
 A scope also says where a scan starts: exact hosts and network addresses are
 tested as they are, and a wildcard pattern is enumerated from its fixed
@@ -62,6 +64,7 @@ class _Pattern:
         text = raw.strip().lower()
         self.network = None
         self.regex = None
+        self.ports: List[int] = []
         if '://' not in text and '/' in text:
             try:
                 self.network = ipaddress.ip_network(text, strict=False)
@@ -72,6 +75,9 @@ class _Pattern:
         if '://' in text:
             text = text.split('://', 1)[1]
         text = re.split(r'[/?#]', text, maxsplit=1)[0]
+        port = re.search(r':(\d+)$', text)
+        if port and 0 < int(port.group(1)) < 65536 and '*' not in text:
+            self.ports.append(int(port.group(1)))
         text = re.sub(r':\d+$', '', text).rstrip('.')
         if not text or not _PATTERN_RE.match(text):
             raise ValueError(f"invalid scope pattern: {raw!r}")
@@ -101,12 +107,15 @@ class _Pattern:
 
 
 def _patterns(raw: Iterable[str]) -> List[_Pattern]:
-    seen, out = set(), []
+    seen: dict = {}
+    out = []
     for item in raw:
         pattern = _Pattern(item)
         if pattern.text not in seen:
-            seen.add(pattern.text)
+            seen[pattern.text] = pattern
             out.append(pattern)
+        else:
+            seen[pattern.text].ports += [port for port in pattern.ports if port not in seen[pattern.text].ports]
     return out
 
 
@@ -210,5 +219,16 @@ class Scope:
 
         return [as_url(p) for p in self._include], [as_url(p) for p in self._exclude]
 
+    def probe_targets(self, host: str) -> List[str]:
+        """What to probe for a host: host:port for each port the scope names for it, else the host."""
+        ports = next((p.ports for p in self._include if p.is_exact and p.text == host), [])
+        return [f"{host}:{port}" for port in ports] or [host]
+
+    def ports(self) -> dict:
+        return {p.text: list(p.ports) for p in self._include if p.ports}
+
     def to_dict(self) -> dict:
-        return {'include': self.include, 'exclude': self.exclude}
+        scope = {'include': self.include, 'exclude': self.exclude}
+        if self.ports():
+            scope['ports'] = self.ports()
+        return scope
