@@ -6,6 +6,10 @@ Patterns
     api-*.example.com   glob inside a label
     10.0.0.0/24         every address in the network
 Exclusions always win over inclusions.
+
+A scope also says where a scan starts: exact hosts and network addresses are
+tested as they are, and a wildcard pattern is enumerated from its fixed
+suffix ('api-*.example.com' -> 'example.com').
 """
 from __future__ import annotations
 
@@ -18,6 +22,15 @@ from urllib.parse import urlsplit
 _HOST_RE = re.compile(r'^[a-z0-9_]([a-z0-9_.-]*[a-z0-9_])?$')
 _PATTERN_RE = re.compile(r'^[a-z0-9_.*-]+$')
 _GLOB_CHARS = '[a-z0-9_.-]*'
+MAX_NETWORK_HOSTS = 65536
+
+
+def is_address(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
 
 
 def host_of(target: str) -> Optional[str]:
@@ -70,6 +83,14 @@ class _Pattern:
     def is_exact(self) -> bool:
         return self.network is None and '*' not in self.text
 
+    @property
+    def root(self) -> Optional[str]:
+        """The domain to enumerate for a wildcard pattern: the labels after its last wildcard."""
+        if self.network is not None or '*' not in self.text:
+            return None
+        suffix = self.text.rsplit('*', 1)[1].partition('.')[2]
+        return suffix if '.' in suffix else None
+
     def matches(self, host: str) -> bool:
         if self.network is not None:
             try:
@@ -95,6 +116,10 @@ class Scope:
         self._exclude = _patterns(exclude)
         if not self._include:
             raise ValueError("scope is empty: give at least one domain, host or pattern")
+        addresses = sum(p.network.num_addresses for p in self._include if p.network is not None)
+        if addresses > MAX_NETWORK_HOSTS:
+            raise ValueError(f"the networks in scope hold {addresses} addresses; the limit is "
+                             f"{MAX_NETWORK_HOSTS}, so split them into smaller scans")
 
     @staticmethod
     def parse_file(path: Path) -> Tuple[List[str], List[str]]:
@@ -142,18 +167,38 @@ class Scope:
         return kept, dropped
 
     def enumeration_roots(self) -> List[str]:
-        """Domains whose subdomains are in scope ('*.example.com' -> 'example.com')."""
+        """Domains to enumerate for the wildcard patterns ('*.example.com' -> 'example.com').
+
+        What enumeration returns still has to pass the scope, so 'api-*.example.com'
+        enumerates example.com and keeps only the hosts that match the pattern.
+        """
         roots = []
         for pattern in self._include:
-            text = pattern.text
-            if pattern.network is None and text.startswith('*.') and '*' not in text[2:]:
-                if text[2:] not in roots:
-                    roots.append(text[2:])
+            if pattern.root and pattern.root not in roots:
+                roots.append(pattern.root)
         return roots
 
     def exact_hosts(self) -> List[str]:
         """Hosts named outright in the scope, minus exclusions."""
         return [p.text for p in self._include if p.is_exact and self.allows(p.text)]
+
+    def seeds(self) -> List[str]:
+        """Hosts to test as they are: the exact hosts, then every address of the networks."""
+        hosts = self.exact_hosts()
+        seen = set(hosts)
+        for pattern in self._include:
+            if pattern.network is None:
+                continue
+            for address in pattern.network.hosts():
+                host = str(address)
+                if host not in seen and self.allows(host):
+                    seen.add(host)
+                    hosts.append(host)
+        return hosts
+
+    def unseeded(self) -> List[str]:
+        """Patterns that match hosts but name neither a host nor a domain to start from ('example.*')."""
+        return [p.text for p in self._include if p.network is None and not p.is_exact and not p.root]
 
     def url_regexes(self) -> Optional[Tuple[List[str], List[str]]]:
         """(in-scope, out-of-scope) URL regexes for crawlers; None if the scope has networks."""

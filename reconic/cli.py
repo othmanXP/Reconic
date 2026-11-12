@@ -15,9 +15,10 @@ from typing import List, Optional
 
 from . import __version__
 from .banner import print_banner
+from .firewall import RECEIPT_NAME, Upstream
 from .notify import (NotifyError, build_message, check_url, describe, first_run_message, payload_for,
                      send)
-from .pipeline import TOOLS, Pipeline, ScanConfig, StageReport, failed_stages
+from .pipeline import INCOMPLETE, TOOLS, Pipeline, ScanConfig, StageReport, failed_stages
 from .runner import Runner, RunOptions
 from .scope import Scope, host_of
 from .store import DB_NAME, KINDS, Store, StoreError, highlights
@@ -65,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser(
         'scan', help='run the recon pipeline',
-        description='Runs enumerate -> resolve -> probe -> crawl -> takeover -> nuclei, never leaving the scope.')
+        description='Runs enumerate -> resolve -> probe -> crawl -> takeover -> nuclei, never leaving the scope. '
+                    'Ctrl-C stops the run and keeps what it has found.')
     target = scan.add_argument_group('scope')
     target.add_argument('-d', '--domain', action='append', default=[], metavar='DOMAIN',
                         help='domain whose subdomains are in scope and get enumerated (repeatable)')
@@ -92,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     net = scan.add_argument_group('network')
     net.add_argument('--proxy', metavar='URL', help='send every tool through this HTTP/SOCKS5 proxy')
     net.add_argument('--tor', action='store_true', help=f"shorthand for --proxy {TOR_PROXY}")
+    net.add_argument('--no-firewall', action='store_true',
+                     help='do not route httpx, katana and nuclei through the scope firewall')
     net.add_argument('-H', '--header', action='append', default=[], metavar='"Name: value"',
                      help='header sent with every request to the target (repeatable)')
     net.add_argument('--cookie', metavar='COOKIE', help='shorthand for -H "Cookie: COOKIE"')
@@ -140,7 +144,11 @@ def build_scope(args: argparse.Namespace) -> Scope:
         file_include, file_exclude = Scope.parse_file(args.scope)
         include += file_include
         exclude += file_exclude
-    return Scope(include, exclude)
+    scope = Scope(include, exclude)
+    if not scope.enumeration_roots() and not scope.seeds():
+        raise ValueError("nothing to start from: the scope names no host, network or domain to enumerate "
+                         f"({', '.join(scope.include)})")
+    return scope
 
 
 def build_options(args: argparse.Namespace) -> RunOptions:
@@ -154,7 +162,10 @@ def build_options(args: argparse.Namespace) -> RunOptions:
             raise ValueError(f'header must look like "Name: value": {header!r}')
     if args.rate_limit is not None and args.rate_limit < 1:
         raise ValueError("--rate-limit must be at least 1")
-    return RunOptions(proxy=TOR_PROXY if args.tor else args.proxy, headers=headers, rate_limit=args.rate_limit)
+    proxy = TOR_PROXY if args.tor else args.proxy
+    if proxy and not args.no_firewall:
+        Upstream(proxy)  # fail now, not mid-scan, on a proxy the firewall cannot chain to
+    return RunOptions(proxy=proxy, headers=headers, rate_limit=args.rate_limit)
 
 
 def select_hosts(text: str, alive: List[dict]) -> List[dict]:
@@ -197,6 +208,8 @@ def _stage_end(report: StageReport) -> None:
     parts = [f"{report.count} {noun}"]
     if report.out_of_scope:
         parts.append(f"{report.out_of_scope} out of scope dropped")
+    if report.blocked:
+        parts.append(f"{report.blocked} blocked by firewall")
     parts.append(f"{report.duration:.1f}s")
     if report.status == 'ok':
         _say(f"  {_paint('✓', 'green')} {report.name:<10} {' · '.join(parts)}")
@@ -228,10 +241,17 @@ async def _doctor() -> int:
 
 def _confirm(scope: Scope, config: ScanConfig, yes: bool) -> bool:
     _say("  Scope")
+    unseeded = scope.unseeded()
     for pattern in scope.include:
-        _say(f"    {_paint('+', 'green')} {pattern}")
+        note = _paint("  filter only: names no host or domain to start from", 'yellow') if pattern in unseeded else ''
+        _say(f"    {_paint('+', 'green')} {pattern}{note}")
     for pattern in scope.exclude:
         _say(f"    {_paint('-', 'red')} {pattern}")
+    if not (config.passive or config.dns_only):
+        if config.firewall:
+            _say("  Firewall    on: httpx, katana and nuclei can only connect to in-scope hosts")
+        else:
+            _say(_paint("  Firewall    off: nothing stops a tool from connecting out of scope", 'yellow'))
     if config.options.proxy:
         _say(f"  Proxy       every tool, DNS lookups may still be made locally by the tools")
     if config.options.headers:
@@ -255,6 +275,15 @@ def _summary(results: dict, run_dir: Path) -> None:
         severity = finding['severity']
         label = _paint(f"{severity:<8}", _SEVERITY_COLORS.get(severity, 'dim'))
         _say(f"    {label} {finding['template']}  {_paint(finding['matched'], 'dim')}")
+    firewall = results['firewall']
+    if firewall['enabled']:
+        _say()
+        _say(f"  Firewall  {firewall['connections']} connection(s) to {len(firewall['hosts'])} in-scope host(s) · "
+             f"{sum(entry['attempts'] for entry in firewall['blocked'])} blocked")
+        for entry in firewall['blocked']:
+            _say(f"    {_paint('blocked', 'yellow')}  {entry['host']}  "
+                 f"{_paint(str(entry['attempts']) + 'x in ' + ', '.join(entry['stages']), 'dim')}")
+        _say(_paint(f"    receipt: {run_dir / RECEIPT_NAME}", 'dim'))
     problems = failed_stages(results)
     if problems:
         _say()
@@ -344,7 +373,7 @@ def _runs(args: argparse.Namespace) -> int:
     for run in runs:
         counts = run['counts']
         incomplete = ', '.join(name for name, stage in run['stages'].items()
-                               if stage['status'] in ('failed', 'timeout'))
+                               if stage['status'] in INCOMPLETE)
         print(f"{run['id']:>4}  {_when(run['started']):<20}  {run['target']:<24} {counts['host']:>6} "
               f"{counts['alive']:>6} {counts['endpoint']:>9} {counts['takeover']:>9} {counts['vuln']:>6}  "
               f"{incomplete}")
@@ -432,7 +461,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         config = ScanConfig(
             scope=scope, name=args.name, output_dir=args.output_dir, options=options,
             passive=args.passive, dns_only=args.dns_only, resolve=not args.no_resolve, crawl=not args.no_crawl, takeover=not args.no_takeover,
-            nuclei=not args.no_nuclei, all_sources=args.all_sources, threads=args.threads,
+            nuclei=not args.no_nuclei, firewall=not args.no_firewall, all_sources=args.all_sources,
+            threads=args.threads,
             depth=args.depth, headless=args.headless, crawl_minutes=args.crawl_minutes,
             severity=args.severity, templates=args.templates, stage_timeout=args.stage_timeout * 60,
         )
@@ -442,11 +472,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         pipeline = Pipeline(config, on_start=_stage_start, on_end=_stage_end,
                             picker=_pick if args.pick and sys.stdin.isatty() else None)
-        results = asyncio.run(pipeline.run())
+        try:
+            results = asyncio.run(pipeline.run())
+        except KeyboardInterrupt:
+            results = pipeline.results  # Python before 3.11 raises here even though the run saved itself
+            if results is None:
+                raise
         _summary(results, pipeline.run_dir)
-        _record(results, pipeline.run_dir, args.output_dir, webhooks)
+        _record(results, pipeline.run_dir, args.output_dir, [] if results['interrupted'] else webhooks)
         _say()
         print(pipeline.run_dir / 'results.json')
+        if results['interrupted']:
+            _say(_paint("  Interrupted; running tools were stopped and the partial results were saved.", 'yellow'))
+            return 130
         return 1 if failed_stages(results) else 0
     except KeyboardInterrupt:
         _say(_paint("\n  Interrupted; running tools were stopped.", 'yellow'))

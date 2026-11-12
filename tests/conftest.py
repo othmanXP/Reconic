@@ -16,7 +16,8 @@ def fake_tools(tmp_path, monkeypatch):
     bin_dir.mkdir()
     log = tmp_path / 'invocations.jsonl'
     monkeypatch.setenv('FAKE_LOG', str(log))
-    for variable in ('FAKE_FAIL', 'FAKE_FAIL_STDOUT', 'FAKE_HANG', 'FAKE_IMPOSTOR', 'FAKE_LABELS'):
+    for variable in ('FAKE_FAIL', 'FAKE_FAIL_STDOUT', 'FAKE_HANG', 'FAKE_IMPOSTOR', 'FAKE_LABELS', 'FAKE_FETCH',
+                     'no_proxy', 'NO_PROXY'):
         monkeypatch.delenv(variable, raising=False)
 
     def install(*names):

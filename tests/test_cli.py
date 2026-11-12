@@ -1,3 +1,11 @@
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import pytest
 
 from reconic.banner import render_banner
@@ -27,6 +35,15 @@ def test_scope_is_required():
         build_scope(parse())
 
 
+def test_scope_with_nothing_to_start_from_is_refused(tmp_path):
+    scope_file = tmp_path / 'scope.txt'
+    scope_file.write_text("example.*\n")
+    with pytest.raises(ValueError, match='nothing to start from'):
+        build_scope(parse('--scope', str(scope_file)))
+    scope_file.write_text("example.*\n10.0.0.0/30\n")
+    assert build_scope(parse('--scope', str(scope_file))).seeds() == ['10.0.0.1', '10.0.0.2']
+
+
 def test_options():
     options = build_options(parse('-u', 'a.example.com', '--tor', '--cookie', 'sid=1', '-H', 'X-Bug: me'))
     assert options.proxy == TOR_PROXY
@@ -35,6 +52,10 @@ def test_options():
         build_options(parse('-u', 'a.example.com', '--tor', '--proxy', 'http://127.0.0.1:8080'))
     with pytest.raises(ValueError):
         build_options(parse('-u', 'a.example.com', '-H', 'no-colon'))
+    # the firewall has to be able to chain to the proxy; without the firewall any proxy is the tools' business
+    with pytest.raises(ValueError, match='--no-firewall'):
+        build_options(parse('-u', 'a.example.com', '--proxy', 'socks4://127.0.0.1:1080'))
+    assert build_options(parse('-u', 'a.example.com', '--proxy', 'socks4://127.0.0.1:1080', '--no-firewall')).proxy
 
 
 def test_select_hosts():
@@ -63,3 +84,32 @@ def test_banner_lines_align_and_fall_back():
     assert '\033[' not in render_banner(color=False)
     colored = render_banner(color=True)
     assert '\033[1m' in colored and '38;2;' not in colored and '38;5;' not in colored  # theme colours only
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='needs POSIX signals')
+def test_ctrl_c_saves_the_run_and_records_it(fake_tools, tmp_path, capsys):
+    out = tmp_path / 'out'
+    env = dict(os.environ, PATH=fake_tools.dir, GOPATH=str(tmp_path / 'go'), FAKE_HANG='katana')
+    env.pop('GOBIN', None)
+    process = subprocess.Popen(
+        [sys.executable, '-m', 'reconic', '--no-banner', 'scan', '-u', 'app.example.com', '-y', '-o', str(out)],
+        cwd=Path(__file__).parent.parent, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.default_int_handler))
+    try:
+        deadline = time.monotonic() + 60
+        while not any(path.stat().st_size for path in out.glob('*/*/raw/crawl.katana.out')):
+            assert process.poll() is None and time.monotonic() < deadline, process.stderr.read()
+            time.sleep(0.05)
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=60)
+    finally:
+        process.kill()
+
+    assert process.returncode == 130
+    assert 'partial results were saved' in stderr
+    results = json.loads(Path(stdout.strip()).read_text())
+    assert results['interrupted'] and [a['url'] for a in results['alive']] == ['https://app.example.com']
+    assert {s['name']: s['status'] for s in results['stages']}['crawl'] == 'interrupted'
+    assert main(['runs', '-o', str(out), '--json']) == 0
+    recorded = json.loads(capsys.readouterr().out)
+    assert len(recorded) == 1 and recorded[0]['stages']['crawl']['status'] == 'interrupted'

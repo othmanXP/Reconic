@@ -76,7 +76,7 @@ def _stage_complete(stages: Dict[str, dict], stage: str) -> Tuple[bool, str]:
         return True, ''  # a scope of fixed hosts needs no enumeration
     if info['status'] == 'skipped':
         return False, f"was skipped ({info['detail']})"
-    return False, 'failed' if info['status'] == 'failed' else 'timed out'
+    return False, {'failed': 'failed', 'interrupted': 'was interrupted'}.get(info['status'], 'timed out')
 
 
 class Store:

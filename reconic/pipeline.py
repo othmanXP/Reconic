@@ -1,20 +1,24 @@
 """Recon pipeline: enumerate -> resolve -> probe -> crawl -> takeover -> nuclei.
 
-Scope is applied to the input and the output of every stage. Each run writes
-into its own directory, so results can never be mixed with an earlier run.
+Scope is applied to the input and the output of every stage, and the tools
+that contact targets run behind the scope firewall. Each run writes into its
+own directory, so results can never be mixed with an earlier run.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import __version__
+from .firewall import RECEIPT_NAME, ScopeFirewall
 from .runner import Runner, RunOptions, ToolError, ToolSpec
-from .scope import Scope
+from .scope import Scope, is_address
 
 SUBFINDER = ToolSpec(
     'subfinder', ('subfinder',), proxy_flag='-proxy', rate_flag='-rl',
@@ -24,18 +28,20 @@ DNSX = ToolSpec(
     install='go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest')
 HTTPX = ToolSpec(
     'httpx', ('httpx', 'httpx-toolkit'), proxy_flag='-http-proxy', header_flag='-H', rate_flag='-rl',
+    firewalled=True,
     install='go install github.com/projectdiscovery/httpx/cmd/httpx@latest')
 KATANA = ToolSpec(
-    'katana', ('katana',), proxy_flag='-proxy', header_flag='-H', rate_flag='-rl',
+    'katana', ('katana',), proxy_flag='-proxy', header_flag='-H', rate_flag='-rl', firewalled=True,
     install='go install github.com/projectdiscovery/katana/cmd/katana@latest')
 # No -duc for nuclei: its own update check is what keeps templates current.
 NUCLEI = ToolSpec(
     'nuclei', ('nuclei',), proxy_flag='-proxy', header_flag='-H', rate_flag='-rl',
-    common_flags=('-silent', '-nc'),
+    common_flags=('-silent', '-nc'), firewalled=True,
     install='go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest')
 
 TOOLS = (SUBFINDER, DNSX, HTTPX, KATANA, NUCLEI)
 STAGES = ('enumerate', 'resolve', 'probe', 'crawl', 'takeover', 'nuclei')
+INCOMPLETE = ('failed', 'timeout', 'interrupted')  # stage statuses that make a run partial
 
 
 @dataclass
@@ -50,6 +56,7 @@ class ScanConfig:
     crawl: bool = True
     takeover: bool = True
     nuclei: bool = True
+    firewall: bool = True
     all_sources: bool = False
     threads: int = 50
     depth: int = 3
@@ -63,11 +70,12 @@ class ScanConfig:
 @dataclass
 class StageReport:
     name: str
-    status: str = 'ok'          # ok | failed | timeout | skipped
+    status: str = 'ok'          # ok | failed | timeout | interrupted | skipped
     detail: str = ''
     duration: float = 0.0
     count: int = 0
     out_of_scope: int = 0
+    blocked: int = 0            # out-of-scope connections the firewall refused during the stage
 
 
 def _json_lines(lines: Sequence[str]) -> List[dict]:
@@ -102,6 +110,13 @@ class Pipeline:
         self.on_end = on_end or (lambda report: None)
         self.picker = picker
         self.reports: List[StageReport] = []
+        self.interrupted = False
+        self.results: Optional[dict] = None
+        self.hosts: List[str] = []
+        self.resolved: List[dict] = []
+        self.alive: List[dict] = []
+        self.endpoints: List[str] = []
+        self.findings: List[dict] = []
 
     # -- helpers ----------------------------------------------------------
 
@@ -119,14 +134,33 @@ class Pipeline:
     def _skip(self, name: str, why: str) -> None:
         self._finish(StageReport(name, 'skipped', why))
 
+    def _interrupt(self) -> None:
+        """Take note of Ctrl-C and carry on just long enough to save what the run has."""
+        self.interrupted = True
+        task = asyncio.current_task()
+        if hasattr(task, 'uncancel'):
+            task.uncancel()
+
     async def _tool(self, report: StageReport, spec: ToolSpec, args: Sequence[str]) -> List[str]:
         """Run a tool for a stage; record failure or timeout on the report, return its output lines."""
         timeout = self.config.stage_timeout
+        firewall = self.runner.firewall
+        if firewall:
+            firewall.stage = report.name
+        blocked, started = firewall.blocked if firewall else 0, time.monotonic()
         try:
             result = await self.runner.run(spec, args, report.name, timeout)
         except ToolError as error:
             report.status, report.detail = 'failed', str(error)
             return []
+        except asyncio.CancelledError:
+            self._interrupt()
+            report.status, report.detail = 'interrupted', f"{spec.name} was stopped; partial results kept"
+            report.duration = time.monotonic() - started
+            return self.runner.partial_lines(spec, report.name)
+        finally:
+            if firewall:
+                report.blocked = firewall.blocked - blocked
         report.duration = result.duration
         if result.timed_out:
             report.status = 'timeout'
@@ -140,7 +174,7 @@ class Pipeline:
     async def _enumerate(self) -> List[str]:
         scope = self.config.scope
         roots = scope.enumeration_roots()
-        seeds = scope.exact_hosts()
+        seeds = scope.seeds()
         if not roots:
             self._skip('enumerate', 'no wildcard domains in scope')
             return seeds
@@ -161,10 +195,14 @@ class Pipeline:
 
         Returns the hosts to probe and the DNS records found. Whenever resolution
         cannot be trusted (skipped, failed, timed out) every host is passed on.
+        Addresses have nothing to resolve and are always passed on.
         """
+        names = [host for host in hosts if not is_address(host)]
         why = ''
         if not self.config.resolve:
             why = 'disabled'
+        elif not names:
+            why = 'only addresses in scope'
         elif self.config.options.proxy:
             why = 'dnsx cannot use a proxy; every host is passed on'
         elif await self.runner.resolve(DNSX) is None:
@@ -172,10 +210,10 @@ class Pipeline:
         if why:
             self._skip('resolve', why)
             return hosts, []
-        self.on_start('resolve', f"dnsx on {len(hosts)} host(s)")
+        self.on_start('resolve', f"dnsx on {len(names)} host(s)")
         report = StageReport('resolve')
-        args = ['-l', self._input_file('resolve', hosts), '-a', '-aaaa', '-cname', '-resp', '-j']
-        wanted, records = set(hosts), {}
+        args = ['-l', self._input_file('resolve', names), '-a', '-aaaa', '-cname', '-resp', '-j']
+        wanted, records = set(names), {}
         for item in _json_lines(await self._tool(report, DNSX, args)):
             host = (item.get('host') or '').lower().rstrip('.')
             addresses = (item.get('a') or []) + (item.get('aaaa') or [])
@@ -186,7 +224,7 @@ class Pipeline:
         self._finish(report)
         if report.status != 'ok':
             return hosts, resolved
-        return [entry['host'] for entry in resolved], resolved
+        return [host for host in hosts if host in records or is_address(host)], resolved
 
     async def _probe(self, hosts: List[str]) -> List[dict]:
         self.on_start('probe', f"httpx on {len(hosts)} host(s)")
@@ -270,69 +308,100 @@ class Pipeline:
 
     # -- run --------------------------------------------------------------
 
+    async def _stages(self) -> None:
+        cfg = self.config
+        self.hosts = await self._enumerate()
+        if self.interrupted:
+            return
+        if cfg.passive or not self.hosts:
+            for name in STAGES[1:]:
+                self._skip(name, 'passive mode' if cfg.passive else 'no in-scope hosts')
+            return
+
+        live_hosts, self.resolved = await self._resolve(self.hosts)
+        if self.interrupted:
+            return
+        if cfg.dns_only:
+            for name in STAGES[2:]:
+                self._skip(name, 'DNS only')
+            return
+
+        if live_hosts:
+            self.alive = await self._probe(live_hosts)
+            if self.interrupted:
+                return
+        else:
+            self._skip('probe', 'no host resolves')
+        if self.alive and self.picker:
+            self.alive = self.picker(self.alive)
+        urls = [entry['url'] for entry in self.alive]
+
+        if not cfg.crawl:
+            self._skip('crawl', 'disabled')
+        elif not urls:
+            self._skip('crawl', 'no alive hosts')
+        else:
+            self.endpoints = await self._crawl(urls)
+            if self.interrupted:
+                return
+
+        names = [host for host in self.hosts if not is_address(host)]  # an address has no DNS record to dangle
+        if not cfg.takeover:
+            self._skip('takeover', 'disabled')
+        elif not names:
+            self._skip('takeover', 'no hostnames in scope')
+        else:
+            self.findings += await self._nuclei('takeover', names, ['-tags', 'takeover'])
+            if self.interrupted:
+                return
+
+        if not cfg.nuclei:
+            self._skip('nuclei', 'disabled')
+        elif not urls:
+            self._skip('nuclei', 'no alive hosts')
+        else:
+            extra = ['-s', cfg.severity]
+            if cfg.templates:
+                extra += ['-t', str(cfg.templates)]
+            self.findings += await self._nuclei('nuclei', urls, extra)
+
     async def run(self) -> dict:
+        """Run the stages and save the results. Ctrl-C stops the run but what it has is still saved."""
         cfg = self.config
         started = datetime.now(timezone.utc)
         self.run_dir.mkdir(parents=True, exist_ok=True)
-
-        hosts = await self._enumerate()
-        resolved: List[dict] = []
-        alive: List[dict] = []
-        endpoints: List[str] = []
-        findings: List[dict] = []
-
-        blocked = 'passive mode' if cfg.passive else ('no in-scope hosts' if not hosts else '')
-        if blocked:
-            for name in STAGES[1:]:
-                self._skip(name, blocked)
-        else:
-            live_hosts, resolved = await self._resolve(hosts)
-        if not blocked and cfg.dns_only:
-            for name in STAGES[2:]:
-                self._skip(name, 'DNS only')
-        elif not blocked:
-            if live_hosts:
-                alive = await self._probe(live_hosts)
+        firewall = {'enabled': False}
+        try:
+            if cfg.firewall and not (cfg.passive or cfg.dns_only):
+                async with ScopeFirewall(cfg.scope, self.run_dir / RECEIPT_NAME, cfg.options.proxy) as running:
+                    self.runner.firewall = running
+                    try:
+                        await self._stages()
+                    finally:
+                        self.runner.firewall = None
+                        firewall = running.summary()
             else:
-                self._skip('probe', 'no host resolves')
-            if alive and self.picker:
-                alive = self.picker(alive)
-            urls = [entry['url'] for entry in alive]
-
-            if not cfg.crawl:
-                self._skip('crawl', 'disabled')
-            elif not urls:
-                self._skip('crawl', 'no alive hosts')
-            else:
-                endpoints = await self._crawl(urls)
-
-            if not cfg.takeover:
-                self._skip('takeover', 'disabled')
-            else:
-                findings += await self._nuclei('takeover', hosts, ['-tags', 'takeover'])
-
-            if not cfg.nuclei:
-                self._skip('nuclei', 'disabled')
-            elif not urls:
-                self._skip('nuclei', 'no alive hosts')
-            else:
-                extra = ['-s', cfg.severity]
-                if cfg.templates:
-                    extra += ['-t', str(cfg.templates)]
-                findings += await self._nuclei('nuclei', urls, extra)
+                await self._stages()
+        except asyncio.CancelledError:
+            self._interrupt()
+        reported = {report.name for report in self.reports}
+        for name in STAGES:
+            if name not in reported:
+                self._skip(name, 'interrupted')
 
         unique, seen = [], set()
-        for finding in findings:
+        for finding in self.findings:
             key = (finding['template'], finding['matched'])
             if key not in seen:
                 seen.add(key)
                 unique.append(finding)
 
-        results = {
+        self.results = results = {
             'reconic_version': __version__,
             'target': self.target,
             'started': started.isoformat(timespec='seconds'),
             'finished': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'interrupted': self.interrupted,
             'scope': cfg.scope.to_dict(),
             'options': {
                 'passive': cfg.passive,
@@ -340,12 +409,13 @@ class Pipeline:
                 'authenticated': bool(cfg.options.headers),
                 'rate_limit': cfg.options.rate_limit,
             },
+            'firewall': firewall,
             'tools': self.runner.resolved(),
             'stages': [asdict(report) for report in self.reports],
-            'subdomains': hosts,
-            'resolved': resolved,
-            'alive': alive,
-            'endpoints': endpoints,
+            'subdomains': self.hosts,
+            'resolved': self.resolved,
+            'alive': self.alive,
+            'endpoints': self.endpoints,
             'findings': unique,
         }
         self._write(results)
@@ -364,4 +434,4 @@ class Pipeline:
 
 
 def failed_stages(results: dict) -> List[Tuple[str, str]]:
-    return [(s['name'], s['detail']) for s in results['stages'] if s['status'] in ('failed', 'timeout')]
+    return [(s['name'], s['detail']) for s in results['stages'] if s['status'] in INCOMPLETE]

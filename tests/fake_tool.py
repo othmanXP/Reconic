@@ -7,6 +7,7 @@ Behaviour follows the name it is invoked as. Environment switches:
   FAKE_HANG      comma-separated tool names that print one line, then sleep
   FAKE_IMPOSTOR  comma-separated binary names that are "some other program"
   FAKE_LABELS    comma-separated subdomain labels subfinder reports (default www,api,admin)
+  FAKE_FETCH     comma-separated http:// URLs katana requests through the proxy it was given
 """
 import json
 import os
@@ -70,6 +71,14 @@ elif name in ('httpx', 'httpx-toolkit'):
         print(json.dumps({'url': f"https://{host}", 'input': host, 'status_code': 200,
                           'title': f"Home of {host}", 'tech': ['nginx']}))
 elif name == 'katana':
+    if os.environ.get('FAKE_FETCH'):
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({'http': value('-proxy')}))
+        for url in os.environ['FAKE_FETCH'].split(','):
+            try:
+                opener.open(url, timeout=10).read()
+            except OSError:
+                pass
     for url in read('-list'):
         print(f"{url}/login")
         print(f"{url}/api/v1/users?id=1")

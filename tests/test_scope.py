@@ -90,3 +90,22 @@ def test_url_regexes_agree_with_allows():
                 'https://evilexample.com/', 'https://example.com.evil.net/', 'https://other.net/?u=example.com']:
         assert crawler_allows(url) == scope.allows(url), url
     assert not any(',' in r for r in included + excluded)  # tool flags split values on commas
+
+
+def test_networks_are_expanded_into_seed_hosts():
+    scope = Scope(['app.example.com', '10.0.0.0/29', '10.0.0.6'], ['10.0.0.4/31'])
+    assert scope.seeds() == ['app.example.com', '10.0.0.6', '10.0.0.1', '10.0.0.2', '10.0.0.3']
+    assert Scope(['10.0.0.5/32']).seeds() == ['10.0.0.5']
+    assert scope.exact_hosts() == ['app.example.com', '10.0.0.6']
+    with pytest.raises(ValueError, match='65536'):
+        Scope(['10.0.0.0/8'])
+    Scope(['app.example.com'], ['10.0.0.0/8'])  # an excluded network can be any size
+
+
+def test_wildcards_are_enumerated_from_their_fixed_suffix():
+    assert Scope(['api-*.example.com']).enumeration_roots() == ['example.com']
+    assert Scope(['*.dev.*.example.co.uk', '*.example.co.uk']).enumeration_roots() == ['example.co.uk']
+    for pattern in ('example.*', '*.com', 'www.*.com'):
+        scope = Scope([pattern])
+        assert scope.enumeration_roots() == [] and scope.unseeded() == [pattern]
+    assert Scope(['*.example.com', '10.0.0.0/30', 'a.example.com']).unseeded() == []

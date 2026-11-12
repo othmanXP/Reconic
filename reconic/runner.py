@@ -32,6 +32,7 @@ class ToolSpec:
     common_flags: Tuple[str, ...] = ('-silent', '-nc', '-duc')
     install: str = ''
     optional: bool = False              # the pipeline works without it
+    firewalled: bool = False            # contacts targets, so it goes through the scope firewall
 
 
 @dataclass
@@ -67,8 +68,7 @@ class ToolResult:
         return self.returncode == 0 and not self.timed_out
 
     def lines(self) -> List[str]:
-        text = self.stdout_path.read_text(encoding='utf-8', errors='replace')
-        return [line.strip() for line in text.splitlines() if line.strip()]
+        return _read_lines(self.stdout_path)
 
     def stderr_tail(self, count: int = 3) -> str:
         text = _ANSI_RE.sub('', self.stderr_path.read_text(encoding='utf-8', errors='replace'))
@@ -79,6 +79,11 @@ class ToolResult:
         # Some tools print their errors on stdout (katana does for bad flags).
         tail = self.stderr_tail() or ' | '.join(self.lines()[-3:])
         return f"{self.tool} exited with code {self.returncode}" + (f": {tail}" if tail else "")
+
+
+def _read_lines(path: Path) -> List[str]:
+    text = path.read_text(encoding='utf-8', errors='replace')
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def default_search_path() -> List[str]:
@@ -121,6 +126,7 @@ class Runner:
         self.raw_dir = Path(raw_dir)
         self.options = options or RunOptions()
         self.search_path = list(search_path) if search_path is not None else default_search_path()
+        self.firewall = None  # a running ScopeFirewall; set by the pipeline for the active stages
         self._resolved: Dict[str, Optional[ResolvedTool]] = {}
 
     async def resolve(self, spec: ToolSpec) -> Optional[ResolvedTool]:
@@ -181,11 +187,16 @@ class Runner:
         argv = [tool.path, *args, *spec.common_flags]
         shown = list(argv)
         options = self.options
-        if options.proxy:
+        proxy = options.proxy
+        if spec.firewalled and self.firewall:
+            # With a proxy of the user's the firewall chains to it. The tool is then given the
+            # SOCKS5 side, which also carries its non-HTTP traffic, so nothing connects directly.
+            proxy = self.firewall.url('socks5' if options.proxy else 'http')
+        if proxy:
             if not spec.proxy_flag:
                 raise ToolError(f"{spec.name} cannot be routed through a proxy; refusing to run it with a proxy set")
-            argv += [spec.proxy_flag, options.proxy]
-            shown += [spec.proxy_flag, _redact_proxy(options.proxy)]
+            argv += [spec.proxy_flag, proxy]
+            shown += [spec.proxy_flag, _redact_proxy(proxy)]
         if spec.header_flag:
             for header in options.headers:
                 argv += [spec.header_flag, header]
@@ -216,3 +227,8 @@ class Runner:
 
         return ToolResult(spec.name, stage, proc.returncode, timed_out,
                           time.monotonic() - started, stdout_path, stderr_path)
+
+    def partial_lines(self, spec: ToolSpec, stage: str) -> List[str]:
+        """Whatever a tool had written for a stage before it was stopped."""
+        path = self.raw_dir / f"{stage}.{spec.name}.out"
+        return _read_lines(path) if path.is_file() else []
